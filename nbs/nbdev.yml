@@ -1,0 +1,14 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "jupygate"
+  site-url: "https://AnswerDotAI.github.io/jupygate"
+  description: "Websocket gateway for Jupyter kernels"
+  repo-branch: main
+  repo-url: "https://github.com/AnswerDotAI/jupygate"
+
+format-links:
+  - html
+  - format: commonmark
+    text: Markdown
