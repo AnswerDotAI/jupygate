@@ -15,7 +15,25 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
 ]
-dependencies = []
+dependencies = [
+  "pyzmq>=26",
+  "jupyter_client>=8",
+  "fastcore>=2.1.17",
+  "starlette>=1.0",
+  "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7.4",
+  "pytest-timeout",
+  "ipymini>=0.1.17",
+  "httpx>=0.27",
+  "websockets>=13",
+]
+
+[project.scripts]
+jupygate = "jupygate.core:main"
 
 [project.urls]
 Repository = "https://github.com/AnswerDotAI/jupygate"
