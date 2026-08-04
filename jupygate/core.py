@@ -508,20 +508,21 @@ def _reload_file():
     return p
 
 def main():
-    "Console entry point: `jupygate [--port N] [--token T] [--reload]`."
+    "Console entry point: `jupygate [--port N] [--token T] [--log-level L] [--reload]`."
     import argparse, uvicorn
     from uvicorn.supervisors import ChangeReload
     p = argparse.ArgumentParser(description='Websocket gateway for Jupyter kernels')
     p.add_argument('--host', default='127.0.0.1')
     p.add_argument('--port', type=int, default=8787)
     p.add_argument('--token', default=None)
+    p.add_argument('--log-level', default='warning', choices=['critical','error','warning','info','debug','trace'])
     p.add_argument('--reload', action='store_true', help='also restart on package source changes (dev)')
     args = p.parse_args()
     if args.token: os.environ['JUPYGATE_TOKEN'] = args.token
     reload_dirs = [str(_reload_file().parent)]
     if args.reload: reload_dirs.append(str(Path(__file__).parent))
     config = uvicorn.Config('jupygate.core:_env_app', factory=True, reload=True, reload_dirs=reload_dirs,
-        host=args.host, port=args.port, log_level='warning', ws_max_size=64*2**20, timeout_graceful_shutdown=5)
+        host=args.host, port=args.port, log_level=args.log_level, ws_max_size=64*2**20, timeout_graceful_shutdown=5)
     server = uvicorn.Server(config)
     try: ChangeReload(config, target=server.run, sockets=[config.bind_socket()]).run()
     except KeyboardInterrupt: pass
