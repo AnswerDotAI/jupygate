@@ -12,7 +12,7 @@ It is a small, readable alternative to running jupyter_server or kernel_gateway 
 - **Replies route by session**: each client signs with its own session id; `parent_header.session` routes shell, control, and stdin traffic back to the requester. iopub is broadcast. The kernel’s HMAC key never leaves the gateway - client auth is a bearer token at the HTTP/websocket layer.
 - **Explicit overflow policy**: each client has a bounded queue that never drops `status`, so a flooded client still sees a truthful busy/idle picture.
 
-The [`core`](00_core.ipynb) notebook builds all of it bottom-up in one story: the two websocket encodings, kernel processes, the zmq side and the ready-wait, routing and fan-out, then the HTTP/websocket surface.
+One nbdev notebook, [`core`](00_core.ipynb), builds it bottom-up - wire formats (the two websocket encodings), kernel processes, channels (the zmq side and the ready-wait), the mux (routing and fan-out), and the gateway server (the HTTP/websocket surface) - and is source, docs, and tests at once.
 
 ## Install
 
@@ -30,6 +30,8 @@ Serve a gateway:
 jupygate --port 8787            # open, for localhost use
 jupygate --port 8787 --token S  # every request must carry the token
 ```
+
+The gateway watches a touch file, `~/.local/state/jupygate/reload/r.py` (created at startup): touching it restarts the gateway with new code, killing all kernels - the deliberate restart lever after upgrading jupygate or a kernel package. `--reload` additionally restarts on package source changes, for development.
 
 Then from any HTTP client:
 

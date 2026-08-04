@@ -17,7 +17,7 @@ classifiers = [
 ]
 dependencies = [
   "pyzmq>=26",
-  "jupyter_client>=8",
+  "jupywire>=0.0.1",
   "fastcore>=2.1.17",
   "starlette>=1.0",
   "uvicorn>=0.30",

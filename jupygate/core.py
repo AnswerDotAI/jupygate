@@ -16,10 +16,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import mkdtemp
 import zmq, zmq.asyncio
-from jupyter_client.connect import write_connection_file
+from jupywire.connect import write_connection_file
 from fastcore.basics import xdumps, revive_dates
-from fastcore.nbio import pack_frames, unpack_frames
-from jupyter_client.session import Session
+from jupywire.session import Session, pack_frames, unpack_frames
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, WebSocketRoute
@@ -360,7 +359,7 @@ class GatewayKernel:
             self.state = 'dead'
             if self.mux: self.mux.close()
         if self.ch: self.ch.close()
-        if self.proc: self.proc.terminate()
+        if self.proc: await asyncio.to_thread(self.proc.terminate)
 
 # %% ../nbs/00_core.ipynb #94e4031d
 class Kernels:
@@ -489,19 +488,32 @@ def serve(app, host:str='127.0.0.1', port:int=8787, log_level:str='warning', in_
     return server
 
 def _env_app():
-    "App factory for `--reload`: the reloader's fresh workers re-import this module, so config rides in the environment"
-    return create_app(auth_token=os.environ.get('JUPYGATE_TOKEN'))
+    "App factory for the reloader: its fresh workers re-import this module, so config rides in the environment; the token is popped so spawned kernels never inherit it"
+    return create_app(auth_token=os.environ.pop('JUPYGATE_TOKEN', None))
+
+def _reload_file():
+    "The restart lever: touching this file restarts the gateway, killing all kernels; created at startup so it is always touchable"
+    from fastcore.xdg import xdg_state_home
+    p = xdg_state_home()/'jupygate'/'reload'/'r.py'
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.touch()
+    return p
 
 def main():
     "Console entry point: `jupygate [--port N] [--token T] [--reload]`."
     import argparse, uvicorn
+    from uvicorn.supervisors import ChangeReload
     p = argparse.ArgumentParser(description='Websocket gateway for Jupyter kernels')
     p.add_argument('--host', default='127.0.0.1')
     p.add_argument('--port', type=int, default=8787)
     p.add_argument('--token', default=None)
-    p.add_argument('--reload', action='store_true', help='restart on source changes (dev only: every restart kills all kernels)')
+    p.add_argument('--reload', action='store_true', help='also restart on package source changes (dev)')
     args = p.parse_args()
-    if not args.reload: return serve(create_app(auth_token=args.token), host=args.host, port=args.port)
     if args.token: os.environ['JUPYGATE_TOKEN'] = args.token
-    uvicorn.run('jupygate.core:_env_app', factory=True, reload=True, reload_dirs=[str(Path(__file__).parent)],
-        host=args.host, port=args.port, log_level='warning', ws_max_size=64*2**20)
+    reload_dirs = [str(_reload_file().parent)]
+    if args.reload: reload_dirs.append(str(Path(__file__).parent))
+    config = uvicorn.Config('jupygate.core:_env_app', factory=True, reload=True, reload_dirs=reload_dirs,
+        host=args.host, port=args.port, log_level='warning', ws_max_size=64*2**20, timeout_graceful_shutdown=5)
+    server = uvicorn.Server(config)
+    try: ChangeReload(config, target=server.run, sockets=[config.bind_socket()]).run()
+    except KeyboardInterrupt: pass
