@@ -67,4 +67,5 @@ d = { 'settings': { 'branch': 'main',
                                'jupygate.core.make_connection': ('core.html#make_connection', 'jupygate/core.py'),
                                'jupygate.core.serve': ('core.html#serve', 'jupygate/core.py'),
                                'jupygate.core.to_frame': ('core.html#to_frame', 'jupygate/core.py'),
-                               'jupygate.core.wait_ready': ('core.html#wait_ready', 'jupygate/core.py')}}}
+                               'jupygate.core.wait_ready': ('core.html#wait_ready', 'jupygate/core.py')},
+            'jupygate.term': {'jupygate.term.term_routes': ('term.html#term_routes', 'jupygate/term.py')}}}

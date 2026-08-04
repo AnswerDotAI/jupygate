@@ -399,9 +399,13 @@ def _authed(request, token):
     hdr = request.headers.get('authorization', '')
     return hdr == f'token {token}' or request.query_params.get('token') == token
 
-def create_app(argv:list[str]=IPYMINI_ARGV, auth_token:str|None=None, qmax:int=1000, buffer_secs:float=3600.0)->Starlette:
-    "The gateway app. `argv` is the default kernel command; creation requests may override it."
+def create_app(argv:list[str]=IPYMINI_ARGV, auth_token:str|None=None, qmax:int=1000, buffer_secs:float=3600.0,
+    term_cull_timeout:float=0)->Starlette:
+    "The gateway app: kernels plus terminals. `argv` is the default kernel command; creation requests may override it."
     kernels = Kernels(argv, qmax=qmax, buffer_secs=buffer_secs)
+    from ptymini.core import PtyRegistry, cull_loop
+    from jupygate.term import term_routes
+    terminals = PtyRegistry(cull_timeout=term_cull_timeout)
 
     def _kernel(request):
         k = kernels.get(request.path_params['kid'])
@@ -460,14 +464,18 @@ def create_app(argv:list[str]=IPYMINI_ARGV, auth_token:str|None=None, qmax:int=1
 
     @asynccontextmanager
     async def lifespan(app):
+        cull = asyncio.create_task(cull_loop(terminals)) if term_cull_timeout else None
         yield
+        if cull: cull.cancel()
         await kernels.shutdown()
+        await terminals.shutdown()
 
     r = lambda p,meth,f: Route('/api/kernels'+p, guard(f), methods=[meth])
     app = Starlette(lifespan=lifespan, routes=[r('','GET',list_kernels), r('','POST',create_kernel), r('/{kid}','GET',get_kernel),
         r('/{kid}','DELETE',delete_kernel), r('/{kid}/interrupt','POST',interrupt), r('/{kid}/restart','POST',restart),
-        WebSocketRoute('/api/kernels/{kid}/channels', channels)])
+        WebSocketRoute('/api/kernels/{kid}/channels', channels), *term_routes(terminals, auth_token)])
     app.state.kernels = kernels
+    app.state.terminals = terminals
     return app
 
 # %% ../nbs/00_core.ipynb #2515195d

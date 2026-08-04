@@ -21,6 +21,7 @@ dependencies = [
   "fastcore>=2.1.17",
   "starlette>=1.0",
   "uvicorn>=0.30",
+  "ptymini>=0.0.1",
 ]
 
 [project.optional-dependencies]
