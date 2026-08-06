@@ -4,4 +4,4 @@ Modules:
 
 - `jupygate.term`: Terminals: gateway-hosted ptys, siblings of kernels"""
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
