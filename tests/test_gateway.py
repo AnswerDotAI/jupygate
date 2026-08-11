@@ -4,6 +4,7 @@ import pytest, httpx
 from websockets.sync.client import connect as ws_connect
 from jupyter_client.session import Session
 from jupygate.core import to_frame, from_frame
+from .conftest import in_proc
 
 timeout = 30
 
@@ -171,6 +172,7 @@ get_ipython().kernel.comm_manager.register_target('echo', _echo)'''
 
 
 
+@in_proc
 def test_shutdown_reaps_kernels():
     "Gateway lifespan shutdown terminates every kernel process; nothing survives the gateway."
     from starlette.testclient import TestClient
@@ -230,6 +232,7 @@ def test_reconnect_replays_and_reports_drops(gateway):
     finally: ws.close()
 
 
+@in_proc
 def test_buffering_policy_and_ttl():
     "A gateway-generated session id is discarded on disconnect; a client-supplied one is parked, then reaped after buffer_secs."
     from jupygate.core import create_app, serve

@@ -32,5 +32,6 @@ ipymini >= 0.1.17 binds iopub as XPUB with `XPUB_VERBOSE` (one welcome per subsc
 ## Tests and mechanics
 
 The notebooks are the primary tests (`nbdev-test --path nbs/00_core.ipynb` runs the whole story against live kernels); `tests/` holds only what makes a bad docs page: load, races, and edge cases (two-client stdin stamping, floods, concurrent routing, both interrupt paths, kernel death, replay-guard interaction with ipymini's HMAC dedup, large buffers, lifespan reap, mid-flood reconnect, buffering policy and TTL). `pytest -q` runs them with pytest-timeout bounds (`timeout_method = thread`, because a hang inside a C call like `ctx.term()` survives signal-based timeouts). Style is fastai (`chkstyle jupygate/core.py`); the `.py` files are generated - edit the notebooks.
+`JUPYGATE_TEST_URL` points the suite at an external gateway instead of the in-thread server, turning it into a conformance suite for any implementation of this API (two tests that inspect in-process internals skip themselves). Kernel creation still uses this venv's ipymini, so the external gateway must run on the same machine.
 
 CI needs ipymini >= 0.1.17 on PyPI (the welcome release), so the release order for first push is: ipymini, then jupygate, then jupyasyncclient (whose notebooks exercise this gateway).
