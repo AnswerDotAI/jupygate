@@ -2,6 +2,14 @@
 
 <!-- do not remove -->
 
+## 0.0.3
+
+### New Features
+
+- Add heartbeat ([#6](https://github.com/AnswerDotAI/jupygate/issues/6))
+- Add jupygate.tools: start/stop gateway binaries in the background ([#5](https://github.com/AnswerDotAI/jupygate/pull/5)), thanks to [@jph00](https://github.com/jph00)
+
+
 ## 0.0.2
 
 ### New Features
