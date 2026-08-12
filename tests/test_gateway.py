@@ -1,5 +1,5 @@
 "The load/race/edge tests deferred from the notebooks; see index + meta design notes for the list's rationale."
-import os, time
+import os, signal, time
 import pytest, httpx
 from websockets.sync.client import connect as ws_connect
 from jupyter_client.session import Session
@@ -255,3 +255,25 @@ def test_buffering_policy_and_ttl():
     finally:
         server.should_exit = True
         server.thread.join(timeout=10)
+
+
+def _model_until(base, kid, pred, tmax=timeout):
+    end = time.monotonic() + tmax
+    while time.monotonic() < end:
+        m = httpx.get(f'{base}/api/kernels/{kid}', timeout=10).json()
+        if pred(m): return m
+        time.sleep(0.25)
+    raise TimeoutError(f'condition not met; last model: {m}')
+
+def test_heartbeat_marks_unresponsive(gateway):
+    "A stopped kernel process stops echoing heartbeats: the model says so, and recovery is observed too."
+    kid = _new_kernel(gateway)
+    m = _model_until(gateway, kid, lambda m: m['last_heartbeat'] is not None)
+    assert m['execution_state'] == 'alive'
+    assert time.time() - m['last_heartbeat'] < timeout
+    os.kill(m['pid'], signal.SIGSTOP)
+    try: _model_until(gateway, kid, lambda m: m['execution_state'] == 'unresponsive')
+    finally: os.kill(m['pid'], signal.SIGCONT)
+    m2 = _model_until(gateway, kid, lambda m: m['execution_state'] == 'alive')
+    assert m2['last_heartbeat'] > m['last_heartbeat']
+    httpx.delete(f'{gateway}/api/kernels/{kid}', timeout=30)

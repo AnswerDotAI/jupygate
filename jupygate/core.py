@@ -128,6 +128,7 @@ class KernelChannels:
                 s.rcvhwm = 0  # before connect. Lossless hop: libzmq's HWM drops silently (statuses included); shedding belongs to ClientQueue alone
             s.connect(addr(info[f'{name}_port']))
             self.socks[name] = s
+        self.hb_addr, self.hb_sock = addr(info['hb_port']), None
 
     async def send(self, channel:str, msg:dict):
         "Sign, serialize, and send a message dict on `channel`, awaiting the socket send so errors and backpressure surface here."
@@ -140,8 +141,23 @@ class KernelChannels:
         idents, msg_list = self.session.feed_identities(parts)
         return self.session.deserialize(msg_list)
 
+    async def beat(self, timeout:float=1.0)->bool:
+        "One heartbeat ping; True if the kernel echoed in time. A missed reply resets the REQ socket (strict alternation)."
+        if self.hb_sock is None:
+            self.hb_sock = self.ctx.socket(zmq.REQ)
+            self.hb_sock.linger = 0
+            self.hb_sock.connect(self.hb_addr)
+        await self.hb_sock.send(b'ping')
+        if await self.hb_sock.poll(timeout*1000):
+            await self.hb_sock.recv()
+            return True
+        self.hb_sock.close()
+        self.hb_sock = None
+        return False
+
     def close(self):
         for s in self.socks.values(): s.close()
+        if self.hb_sock: self.hb_sock.close()
         self.ctx.term()
 
 # %% ../nbs/00_core.ipynb #34e7a2c1
@@ -323,6 +339,7 @@ class GatewayKernel:
         self.id = uuid.uuid4().hex
         self.proc = self.ch = self.mux = self._watcher = None
         self.state = 'starting'
+        self.last_beat = None
 
     async def start(self, timeout:float=60.0):
         self.proc = KernelProc(**self.spec)
@@ -334,12 +351,25 @@ class GatewayKernel:
         return self
 
     async def _watch(self):
-        while self.proc.alive(): await asyncio.sleep(0.5)
-        if self.state=='alive':
+        misses = 0
+        while self.proc.alive():
+            if await self.ch.beat():
+                self.last_beat, misses = time.time(), 0
+                if self.state=='unresponsive':
+                    log.warning(f'kernel {self.id}: responsive again')
+                    self.state = 'alive'
+            else:
+                misses += 1
+                if misses>=3 and self.state=='alive':
+                    log.warning(f'kernel {self.id}: unresponsive, 3 heartbeats missed')
+                    self.state = 'unresponsive'
+            await asyncio.sleep(1.0)
+        if self.state in ('alive','unresponsive'):
             self.state = 'dead'
             self.mux.synthesize_status('dead')
 
-    def model(self)->dict: return dict(id=self.id, name='', execution_state=self.state, connections=self.mux.n_attached if self.mux else 0)
+    def model(self)->dict: return dict(id=self.id, name='', execution_state=self.state, connections=self.mux.n_attached if self.mux else 0,
+        pid=self.proc.pid if self.proc else None, last_heartbeat=self.last_beat)
     def interrupt(self): self.proc.interrupt()
 
     async def restart(self, timeout:float=60.0):
