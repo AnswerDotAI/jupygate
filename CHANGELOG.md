@@ -2,6 +2,13 @@
 
 <!-- do not remove -->
 
+## 0.0.4
+
+### New Features
+
+- Reject unauthorized and unknown kernel/terminal websocket connections with HTTP 403/404 handshake denials instead of close codes ([#7](https://github.com/AnswerDotAI/jupygate/issues/7))
+
+
 ## 0.0.3
 
 ### New Features
