@@ -4,4 +4,4 @@ Modules:
 
 - `jupygate.term`: Host terminal ptys on the gateway alongside kernels"""
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
