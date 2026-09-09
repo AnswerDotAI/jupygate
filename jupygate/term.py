@@ -1,8 +1,12 @@
-"""Terminals: gateway-hosted ptys, siblings of kernels
+"""Host terminal ptys on the gateway alongside kernels
 
-Kernels moved behind the gateway, but the terminal features of jupygate's clients (solveit's embedded terminal, ipyai's shell mode) spawn ptys in their own process — the wrong side of the gateway the moment the kernel is remote. A terminal must live where the kernel lives: same machine, container, and filesystem. So terminals are a gateway resource, siblings of kernels, mirroring [jupyter's terminals API](https://github.com/jupyter-server/jupyter_server_terminals): named terminals you can list, create, delete, and attach to over a websocket — with replay on reattach, so a page refresh or dropped connection resumes the *same* shell with recent scrollback. The pty sessions themselves are [ptymini](https://github.com/AnswerDotAI/ptymini)'s (`PtySession`/`PtyRegistry`, extracted from here); this module owns what is genuinely the gateway's: the REST translation, the websocket framing, auth, and privilege policy (`_sudo`). Design notes and the choreography audit live in `meta/TERM.md`.
+A terminal for a remote kernel needs to run on the same machine, in the same container and filesystem. Spawning the shell in a client process puts it in the wrong environment. Solveit's embedded terminal and ipyai's shell mode need a gateway connection for this reason.
 
-The websocket framing is bytes-native rather than [terminado](https://github.com/jupyter/terminado)'s JSON-of-decoded-text: binary frames carry pty bytes verbatim in both directions, and text frames carry JSON control messages. Client parsers that watch the stream for escape sequences (ipyai's sentinel choreography) need the raw bytes; decode/re-encode is a fidelity risk with nothing bought.
+Jupygate hosts named terminals alongside its kernels. Clients can list, create, and delete terminals through [Jupyter's terminals REST API](https://github.com/jupyter-server/jupyter_server_terminals). They attach to a running terminal over a websocket. Reconnecting after a page refresh or dropped connection resumes the same shell and replays recent scrollback.
+
+[Ptymini](https://github.com/AnswerDotAI/ptymini) manages the pty sessions with `PtySession` and `PtyRegistry`. Those classes originally lived here. This module translates REST requests and websocket frames into ptymini calls. It checks authentication and applies user privileges through `_sudo`. The design notes and ipyai's stream-parsing requirements are in `meta/TERM.md`.
+
+The websocket sends pty bytes unchanged in both directions. Text frames contain JSON control messages. This differs from [terminado](https://github.com/jupyter/terminado), which sends decoded terminal text inside JSON. Ipyai identifies command boundaries by parsing escape sequences in the byte stream. Decoding and re-encoding could alter those bytes. The gateway leaves them intact.
 
 Docs: https://AnswerDotAI.github.io/jupygate/term.html.md"""
 
@@ -39,9 +43,9 @@ def term_routes(terminals:PtyRegistry, auth_token:str|None=None)->list:
         return Response(status_code=204)
 
     async def channel(ws):
-        if not _authed(ws, auth_token): return await ws.close(code=4403)
+        if not _authed(ws, auth_token): return await ws.send_denial_response(JSONResponse(dict(message='forbidden'), status_code=403))
         t = terminals.get(ws.path_params['name'])
-        if t is None: return await ws.close(code=4404)
+        if t is None: return await ws.send_denial_response(JSONResponse(dict(message='no such terminal'), status_code=404))
         await ws.accept()
         await ws.send_text(json.dumps(dict(type='setup', name=t.name)))
         async def pump():

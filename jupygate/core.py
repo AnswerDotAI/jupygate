@@ -162,7 +162,7 @@ class KernelChannels:
 
 # %% ../nbs/00_core.ipynb #34e7a2c1
 async def wait_ready(ch:KernelChannels, timeout:float=30.0, probe_every:float=0.5)->dict:
-    "Block until the kernel answers `kernel_info` and iopub is proven live; returns the kernel_info reply content, leaving both channels clean."
+    "Wait for a kernel_info reply and iopub traffic, drain readiness probes, and return the reply content."
     loop = asyncio.get_running_loop()
     end = loop.time() + timeout
     def left(cap=1.0):
@@ -199,7 +199,7 @@ async def wait_ready(ch:KernelChannels, timeout:float=30.0, probe_every:float=0.
 
 # %% ../nbs/00_core.ipynb #41d52e28
 class ClientQueue:
-    "Outbound queue of encoded frames for one client. The bound governs iopub only, and never drops `status` while attached."
+    "Outbound frames for one client; attached queues exempt statuses and non-iopub messages from the bound."
     def __init__(self, session_id:str, send, qmax:int=1000, buffer:bool=True):
         self.session_id, self.qmax, self.buffer = session_id, qmax, buffer
         self.q, self.dropped, self._drop_mark, self._wake = deque(), 0, 0, asyncio.Event()
@@ -232,7 +232,7 @@ class ClientQueue:
         self._wake.set()
 
     def force(self, msg:dict):
-        "Queue `msg` past the bound (reattach synthesis: exactly two messages, never more)."
+        "Append a frame without checking the bound; reattachment uses this for its warning and status."
         self.q.append((msg['header']['msg_type'], to_frame(msg)))
         self._wake.set()
 
@@ -414,7 +414,7 @@ class Kernels:
         await gk.shutdown()
 
     async def shutdown(self):
-        "Reap every kernel; nothing survives the registry."
+        "Attempt shutdown of every registered kernel, then clear the registry."
         await asyncio.gather(*[k.shutdown() for k in self.kernels.values()], return_exceptions=True)
         self.kernels.clear()
 
@@ -466,9 +466,9 @@ def create_app(argv:list[str]=IPYMINI_ARGV, auth_token:str|None=None, qmax:int=1
         return JSONResponse(gk.model())
 
     async def channels(ws):
-        if not _authed(ws, auth_token): return await ws.close(code=4403)
+        if not _authed(ws, auth_token): return await ws.send_denial_response(JSONResponse(dict(message='forbidden'), status_code=403))
         gk = kernels.get(ws.path_params['kid'])
-        if gk is None or gk.mux is None: return await ws.close(code=4404)
+        if gk is None or gk.mux is None: return await ws.send_denial_response(JSONResponse(dict(message='no such kernel'), status_code=404))
         sid = ws.query_params.get('session_id')
         sid, buffer = sid or uuid.uuid4().hex, sid is not None
         await ws.accept()
