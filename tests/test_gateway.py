@@ -3,7 +3,7 @@ import os, signal, time
 import pytest, httpx
 from websockets.sync.client import connect as ws_connect
 from jupyter_client.session import Session
-from jupygate.core import to_frame, from_frame
+from jupywire.session import to_frame, from_frame
 from .conftest import in_proc
 
 timeout = 30
