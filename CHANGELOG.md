@@ -2,6 +2,13 @@
 
 <!-- do not remove -->
 
+## 0.0.5
+
+### New Features
+
+- Use jupywire `to_frame`/`from_frame` for websocket framing, drop local dumps/loads codec helpers ([#8](https://github.com/AnswerDotAI/jupygate/issues/8))
+
+
 ## 0.0.4
 
 ### New Features
