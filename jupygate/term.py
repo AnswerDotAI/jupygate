@@ -6,7 +6,7 @@ Jupygate hosts named terminals alongside its kernels. Clients can list, create, 
 
 [Ptymini](https://github.com/AnswerDotAI/ptymini) manages the pty sessions with `PtySession` and `PtyRegistry`. Those classes originally lived here. This module translates REST requests and websocket frames into ptymini calls. It checks authentication and applies user privileges through `_sudo`. The design notes and ipyai's stream-parsing requirements are in `meta/TERM.md`.
 
-The websocket sends pty bytes unchanged in both directions. Text frames contain JSON control messages. This differs from [terminado](https://github.com/jupyter/terminado), which sends decoded terminal text inside JSON. Ipyai identifies command boundaries by parsing escape sequences in the byte stream. Decoding and re-encoding could alter those bytes. The gateway leaves them intact.
+The websocket speaks [terminado](https://github.com/jupyter/terminado)'s JSON-array protocol at `/terminals/websocket/{name}`: UTF-8 `stdout`/`stdin` text frames, `setup`, `set_size`, and `disconnect` (carrying the exit code as a third element), plus a `gap` frame when a slow client falls behind the replay ring. PTY output is decoded incrementally as UTF-8 (`errors="replace"`), preserving split multi-byte characters and escape sequences.
 
 Docs: https://AnswerDotAI.github.io/jupygate/term.html.md"""
 
@@ -16,7 +16,7 @@ Docs: https://AnswerDotAI.github.io/jupygate/term.html.md"""
 __all__ = ['term_routes']
 
 # %% ../nbs/01_term.ipynb #e7bcf949
-import asyncio, json
+import asyncio, codecs, json
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, WebSocketRoute
 from ptymini.core import PtyRegistry, Gap
@@ -47,21 +47,29 @@ def term_routes(terminals:PtyRegistry, auth_token:str|None=None)->list:
         t = terminals.get(ws.path_params['name'])
         if t is None: return await ws.send_denial_response(JSONResponse(dict(message='no such terminal'), status_code=404))
         await ws.accept()
-        await ws.send_text(json.dumps(dict(type='setup', name=t.name)))
+        await ws.send_text(json.dumps(['setup', dict(name=t.name)]))
+        dec = codecs.getincrementaldecoder('utf-8')(errors='replace')
         async def pump():
             async for item in t.attach(gaps=True):
-                if isinstance(item, Gap): await ws.send_text(json.dumps(dict(type='gap', bytes=int(item))))
-                else: await ws.send_bytes(item)
-            await ws.send_text(json.dumps(dict(type='eof', code=t.exit_code)))
+                if isinstance(item, Gap):
+                    if tail := dec.decode(b'', final=True): await ws.send_text(json.dumps(['stdout', tail]))
+                    dec.reset()
+                    await ws.send_text(json.dumps(['gap', int(item)]))
+                elif text := dec.decode(item): await ws.send_text(json.dumps(['stdout', text]))
+            if tail := dec.decode(b'', final=True): await ws.send_text(json.dumps(['stdout', tail]))
+            await ws.send_text(json.dumps(['disconnect', 1, t.exit_code]))
+            await ws.close()
         task = asyncio.create_task(pump())
         try:
             while True:
                 event = await ws.receive()
                 if event['type'] == 'websocket.disconnect': break
-                if event.get('bytes'): t.write(event['bytes'])
-                elif event.get('text'):
-                    c = json.loads(event['text'])
-                    if c.get('type') == 'set_size': t.resize(c['rows'], c['cols'])
+                if not (txt := event.get('text')): continue
+                try: c = json.loads(txt)
+                except json.JSONDecodeError: continue
+                if not isinstance(c, list) or not c: continue
+                if c[0] == 'stdin' and len(c) >= 2 and isinstance(c[1], str): t.write(c[1].encode())
+                elif c[0] == 'set_size' and len(c) >= 3: t.resize(int(c[1]), int(c[2]))
         finally: task.cancel()
 
     def guard(fn):
@@ -73,4 +81,4 @@ def term_routes(terminals:PtyRegistry, auth_token:str|None=None)->list:
 
     r = lambda p,meth,f: Route('/api/terminals'+p, guard(f), methods=[meth])
     return [r('','GET',list_terms), r('','POST',create_term), r('/{name}','GET',get_term),
-        r('/{name}','DELETE',delete_term), WebSocketRoute('/api/terminals/{name}/channel', channel)]
+        r('/{name}','DELETE',delete_term), WebSocketRoute('/terminals/websocket/{name}', channel)]
