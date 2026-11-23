@@ -1,52 +1,47 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.13,<2.0", "fastws-cli>=0.0.39"]
+build-backend = "fastws.build_backend"
 
 [project]
 name = "jupygate"
 dynamic = ["version"]
-description = "Websocket gateway for Jupyter kernels"
-readme = "README.md"
-requires-python = ">=3.10"
+description = "Jupyter kernel and terminal gateway with an MCP server, as a single binary"
 license = "Apache-2.0"
-authors = [{name = "Jeremy Howard", email = "github@jhoward.fastmail.fm"}]
-keywords = ['nbdev']
+requires-python = ">=3.10"
+readme = "README.md"
+authors = [{name = "Jeremy Howard"}]
+maintainers = [{name = "fast.ai", email = "infos@fast.ai"}]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
 ]
-dependencies = [
-  "pyzmq>=26",
-  "jupywire>=0.1.14",
-  "fastcore>=2.1.17",
-  "starlette>=1.0",
-  "uvicorn>=0.30",
-  "ptymini>=0.0.1",
-]
+dependencies = ["ipymini>=0.1.26"]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=7.4",
-  "pytest-timeout",
-  "ipymini>=0.1.17",
-  "httpx>=0.27",
-  "websockets>=13",
+    "fastws-cli>=0.0.39",
+    "pytest>=7.4",
+    "pytest-asyncio",
+    "pytest-timeout",
+    "pytest-xdist",
+    "httpx>=0.27",
+    "websockets>=13",
+    "jupyter-client",
+    "ipykernel",
+    "jupywire>=0.1.15",
+    "jupyasyncclient>=0.2.32",
 ]
 
-[project.scripts]
-jupygate = "jupygate.core:main"
-
 [project.urls]
+Homepage = "https://github.com/AnswerDotAI/jupygate"
 Repository = "https://github.com/AnswerDotAI/jupygate"
-Documentation = "https://AnswerDotAI.github.io/jupygate/"
+Issues = "https://github.com/AnswerDotAI/jupygate/issues"
 
-[project.entry-points.nbdev]
-jupygate = "jupygate._modidx:d"
+[tool.maturin]
+bindings = "bin"
 
-[tool.setuptools.dynamic]
-version = {attr = "jupygate.__version__"}
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }]
 
-[tool.setuptools.packages.find]
-include = ["jupygate"]
-
-[tool.nbdev]
+[tool.fastship]
+branch = "main"

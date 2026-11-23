@@ -1,18 +1,51 @@
 import os
-import pytest
-from jupygate.core import create_app, serve
 
-@pytest.fixture
-def gateway():
-    "A live gateway's base URL: JUPYGATE_TEST_URL if set (an external gateway under conformance test), else a fresh in-thread server."
+import pytest, httpx
+from helpers import _new_kernel
+from jupyasyncclient import start_gateway
+
+_root = None
+
+
+@pytest.fixture(scope='session', autouse=True)
+def jupyter_path(tmp_path_factory):
+    "A scratch Jupyter data directory, first on the kernelspec search path of every gateway the suite starts."
+    jupyter = tmp_path_factory.mktemp('jupyter')
+    os.environ['JUPYTER_PATH'] = str(jupyter)
+    return jupyter
+
+
+@pytest.fixture(scope='session')
+def gateway(tmp_path_factory):
+    "A live gateway's base URL: JUPYGATE_TEST_URL if set, else the installed `jupygate` serving a scratch files root."
+    global _root
     url = os.environ.get('JUPYGATE_TEST_URL')
     if url:
         yield url.rstrip('/')
         return
-    server = serve(create_app(), port=0, in_thread=True)
-    yield server.url
-    server.should_exit = True
-    server.thread.join(timeout=10)
+    _root = tmp_path_factory.mktemp('files')
+    g = start_gateway(['jupygate', '--root', str(_root)])
+    yield g.url
+    g.stop()
 
-in_proc = pytest.mark.skipif(bool(os.environ.get('JUPYGATE_TEST_URL')),
-    reason='inspects in-process gateway internals; not a conformance test')
+
+@pytest.fixture
+def files_root(gateway):
+    "The gateway's scratch files root; unknowable for an external gateway."
+    if _root is None: pytest.skip('external gateway: files root unknown')
+    return _root
+
+
+@pytest.fixture
+def kernels_dir(gateway, jupyter_path):
+    "A scratch kernels directory, first on the gateway's kernelspec search path. Skips for an external gateway."
+    if _root is None: pytest.skip('external gateway: kernelspec path unknown')
+    return jupyter_path/'kernels'
+
+
+@pytest.fixture(scope='session')
+def shared_kernel(gateway):
+    "One kernel shared by the non-destructive messaging tests: the spawn paid once per worker, teardown owned here."
+    kid = _new_kernel(gateway)
+    yield kid
+    httpx.delete(f'{gateway}/api/kernels/{kid}', timeout=30)

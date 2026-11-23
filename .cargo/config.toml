@@ -1,0 +1,5 @@
+[term]
+quiet = true
+
+[alias]
+spec = "run --profile test --example spec"
