@@ -242,15 +242,16 @@ async fn watch_lifecycle(lc: Arc<KernelLifecycle>) {
     loop {
         let alive = lc.proc_.lock().await.as_mut().is_some_and(KernelProc::alive);
         if !alive { break; }
-        let Some(ch) = lc.core.channels() else { return };
-        if ch.beat(Duration::from_secs(1)).await {
-            *lc.last_beat.lock().await = Some(now());
-            misses = 0;
-            if lc.unresponsive.swap(false, Ordering::Relaxed) { eprintln!("kernel {}: responsive again", lc.core.kid); }
-        } else {
-            misses += 1;
-            if misses >= 3 && *lc.phase.lock().await == LifecyclePhase::Running && !lc.unresponsive.swap(true, Ordering::Relaxed) {
-                eprintln!("kernel {}: unresponsive, 3 heartbeats missed", lc.core.kid);
+        if let Some(ch) = lc.core.channels() {
+            if ch.beat(Duration::from_secs(1)).await {
+                *lc.last_beat.lock().await = Some(now());
+                misses = 0;
+                if lc.unresponsive.swap(false, Ordering::Relaxed) { eprintln!("kernel {}: responsive again", lc.core.kid); }
+            } else {
+                misses += 1;
+                if misses >= 3 && *lc.phase.lock().await == LifecyclePhase::Running && !lc.unresponsive.swap(true, Ordering::Relaxed) {
+                    eprintln!("kernel {}: unresponsive, 3 heartbeats missed", lc.core.kid);
+                }
             }
         }
         time::sleep(Duration::from_secs(1)).await;

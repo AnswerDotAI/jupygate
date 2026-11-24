@@ -3,7 +3,7 @@ import os, stat, tempfile, time
 from ast import literal_eval
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import httpx
+import httpx, pytest
 from jupywire.session import Session, to_frame
 from jupywire.route import JmsgQueues
 from helpers import _connect, _exec, _recv_until, client
@@ -70,8 +70,9 @@ def test_restart_story(gateway, files_root):
 
 async def test_independent_creates_death_and_delete_during_restart(gateway, files_root):
     "Two direct POST /api/kernels with the same path create independent kernels; death is broadcast and shows in the model; DELETE cancels a hung restart promptly without waiting for startup timeout."
-    r1 = httpx.post(f'{gateway}/api/kernels', json=dict(path='pf.ipynb'), timeout=90)
-    r2 = httpx.post(f'{gateway}/api/kernels', json=dict(path='pf.ipynb'), timeout=90)
+    # Kernel launchers can outlive their sockets while cleaning up.
+    launch = dict(path='pf.ipynb', argv=['sh', '-c', 'python -m ipymini -f "$1"; sleep 3', 'sh', '{connection_file}'])
+    r1, r2 = [httpx.post(f'{gateway}/api/kernels', json=launch, timeout=90) for _ in range(2)]
     assert r1.status_code == 201 and r2.status_code == 201
     kid1, kid2 = r1.json()['id'], r2.json()['id']
     assert kid1 != kid2, 'direct kernel creates must be independent'
@@ -81,10 +82,13 @@ async def test_independent_creates_death_and_delete_during_restart(gateway, file
     try:
         async with client(gateway, kid1) as kc:
             iopub = JmsgQueues(kc, queues=('iopub',))
-            kc.execute("import os; os._exit(9)")
-            m = await iopub.jmsg_for('status', pred=lambda m: m['content']['execution_state'] == 'dead', queue='iopub')
-            assert m['channel'] == 'iopub'
+            await kc.shutdown()
+            await iopub.jmsg_for('execution_lost', queue='iopub')
+            lost = httpx.get(f'{gateway}/api/kernels/{kid1}').json()
+            assert lost['execution_lost'] and not lost['unresponsive'] and lost['execution_state'] == 'idle'
+            await iopub.jmsg_for('status', pred=lambda m: m['content']['execution_state'] == 'dead', queue='iopub')
             assert httpx.get(f'{gateway}/api/kernels/{kid1}', timeout=10).json()['execution_state'] == 'dead'
+            with pytest.raises(ProcessLookupError): os.kill(lost['pid'], 0)
         assert httpx.get(f'{gateway}/api/kernels/{kid2}', timeout=10).json()['execution_state'] == 'idle'
 
         # Delete cancels a hung restart immediately instead of blocking on START_TIMEOUT.
