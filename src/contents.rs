@@ -85,6 +85,12 @@ pub fn rfc3339(t: SystemTime) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.{micros:06}Z")
 }
 
+/// Format Unix epoch seconds as an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS.ffffffZ`).
+pub fn rfc3339_secs(secs: f64) -> String {
+    let t = if secs.is_finite() && secs > 0.0 { UNIX_EPOCH + std::time::Duration::from_secs_f64(secs) } else { UNIX_EPOCH };
+    rfc3339(t)
+}
+
 pub fn mtime_secs(md: &fs::Metadata) -> f64 { md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs_f64()).unwrap_or(0.0) }
 
 fn guess_mimetype(path: &Path, format: Option<&str>) -> String {

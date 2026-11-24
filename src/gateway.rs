@@ -76,19 +76,21 @@ impl Launch {
     }
 
     /// Spawn a process from this recipe with per-spawn path, gateway URL, and optional caller secrets.
-    /// Precedence: base (`env` or inherited) -> `ks_env` -> `caller_secrets` -> `appendenv` -> `JUPYGATE_*`.
+    /// Precedence: inherited -> `ks_env` -> `caller_secrets` -> `env` -> `appendenv` -> `JUPYGATE_*`.
     pub fn spawn_with(&self, root: &Path, kid: &str, ctx: &SpawnContext) -> std::io::Result<KernelProc> {
-        let cwd = paths::process_cwd(root, self.cwd.as_deref(), ctx.path.as_deref())?;
+        let env_cwd = self.env.as_ref().and_then(|e| e.get("KERNEL_WORKING_DIR")).map(String::as_str).filter(|s| !s.is_empty());
+        let cwd = paths::process_cwd(root, self.cwd.as_deref().or(env_cwd), ctx.path.as_deref())?;
         let mut appendenv = self.ks_env.clone();
         if let Some(secrets) = ctx.caller_secrets.as_ref() { appendenv.extend(secrets.iter().map(|(k, v)| (k.clone(), v.clone()))); }
+        if let Some(env) = self.env.as_ref() { appendenv.extend(env.iter().map(|(k, v)| (k.clone(), v.clone()))); }
         appendenv.extend(self.appendenv.iter().map(|(k, v)| (k.clone(), v.clone())));
         let url = ctx.self_url.as_deref().or_else(|| crate::SELF_URL.get().map(String::as_str));
         let extra = [
             ("JUPYGATE_URL", url), ("JUPYGATE_KERNEL_ID", Some(kid)), ("JUPYGATE_KERNEL_PATH", ctx.path.as_deref()),
             ("JUPYGATE_LAUNCHER", self.launcher.as_deref()),
         ];
-        KernelProc::spawn(&SpawnOpts { argv: &self.argv, env: self.env.as_ref(), appendenv: Some(&appendenv), extra_env: &extra,
-            cwd: cwd.as_deref().and_then(|p| p.to_str()), conn_prefix: ctx.conn_prefix })
+        KernelProc::spawn(&SpawnOpts { argv: &self.argv, appendenv: Some(&appendenv), extra_env: &extra, cwd: cwd.as_deref().and_then(|p| p.to_str()),
+            conn_prefix: ctx.conn_prefix })
     }
 }
 
@@ -184,8 +186,8 @@ impl KernelLifecycle {
     pub async fn model(&self, path: Option<String>) -> KernelModel {
         KernelModel { id: self.core.kid.clone(), name: self.launch.name.clone(), language: self.core.language(),
             execution_state: self.execution_state().await.to_string(), unresponsive: self.unresponsive(), execution_lost: self.execution_lost(),
-            connections: self.core.n_attached(), pid: self.pid().await, last_heartbeat: self.last_heartbeat().await, last_activity: self.core.last_activity(),
-            path }
+            connections: self.core.n_attached(), pid: self.pid().await, last_heartbeat: self.last_heartbeat().await,
+            last_activity: crate::contents::rfc3339_secs(self.core.last_activity()), path }
     }
 
     /// Mark the kernel `dead` and broadcast the synthesized `dead` status.
@@ -277,7 +279,7 @@ impl<E> ManagedKernel<E> {
 #[derive(Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct KernelModel {
     pub id: String, pub name: String, pub language: String, pub execution_state: String, pub unresponsive: bool, pub execution_lost: bool,
-    pub connections: usize, pub pid: u32, pub last_heartbeat: Option<f64>, pub last_activity: f64, pub path: Option<String>
+    pub connections: usize, pub pid: u32, pub last_heartbeat: Option<f64>, pub last_activity: String, pub path: Option<String>
 }
 
 /// Abort pump tasks and run close cleanup if an async `create` future is dropped before publication.
@@ -577,7 +579,7 @@ impl Kernels {
     pub async fn create(&self, input: LaunchInput, path: Option<String>) -> Result<KernelModel, String> {
         if self.pool.is_shutting_down() { return Err("gateway shutting down".into()); }
         let launch = task::spawn_blocking(move || Launch::resolve(input)).await.expect("resolve task panicked").map_err(|e| e.to_string())?;
-        let id = Uuid::new_v4().simple().to_string();
+        let id = Uuid::new_v4().to_string();
         let entry = KernelMux::new(self.pool.qmax(), path, id.clone());
         Ok(self.pool.create(id, launch, entry).await?.model().await)
     }

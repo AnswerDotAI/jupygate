@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "jupygate",
-    "version": "0.1.0"
+    "version": "0.1.2"
   },
   "paths": {
     "/": {
@@ -1231,8 +1231,7 @@
             "format": "double"
           },
           "last_activity": {
-            "type": "number",
-            "format": "double"
+            "type": "string"
           },
           "path": {
             "type": [
@@ -1514,8 +1513,7 @@
             "type": "boolean"
           },
           "last_activity": {
-            "type": "number",
-            "format": "double"
+            "type": "string"
           }
         },
         "required": [

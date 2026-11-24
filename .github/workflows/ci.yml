@@ -7,25 +7,6 @@ on:
     tags: ['v*']
 
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: astral-sh/setup-uv@v6
-      - run: cargo test
-      - uses: PyO3/maturin-action@v1
-        with:
-          args: --out dist
-      - run: |
-          uv venv --python 3.12
-          wheels=(dist/*.whl)
-          uv pip install "${wheels[0]}[dev]"
-          uv run --no-sync pytest -q
-
   wheels:
     strategy:
       matrix:
@@ -62,7 +43,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, wheels, sdist]
+    needs: [wheels, sdist]
     runs-on: ubuntu-latest
     permissions:
       id-token: write

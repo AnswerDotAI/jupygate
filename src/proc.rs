@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 /// Parameters for spawning a kernel process.
 pub struct SpawnOpts<'a> {
     pub argv: &'a [String],
-    pub env: Option<&'a HashMap<String, String>>,
     pub appendenv: Option<&'a HashMap<String, String>>,
     /// Gateway-injected variables applied last: `Some(v)` sets, `None` removes from inherited env.
     pub extra_env: &'a [(&'a str, Option<&'a str>)],
@@ -29,7 +28,6 @@ impl KernelProc {
         let cmd: Vec<String> = opts.argv.iter().map(|a| a.replace("{connection_file}", &conn_path)).collect();
         let mut c = Command::new(&cmd[0]);
         c.args(&cmd[1..]);
-        if let Some(e) = opts.env { c.env_clear(); for (k, v) in e { c.env(k, v); } }
         if let Some(e) = opts.appendenv { for (k, v) in e { c.env(k, v); } }
         if let Some(d) = opts.cwd { c.current_dir(d); }
         c.env("JPY_PARENT_PID", process::id().to_string());

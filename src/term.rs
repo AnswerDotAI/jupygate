@@ -17,7 +17,7 @@ use std::{env, fs};
 use tokio::sync::watch;
 
 #[derive(Clone, serde::Serialize, schemars::JsonSchema)]
-pub struct TermModel { pub name: String, pub alive: bool, pub last_activity: f64 }
+pub struct TermModel { pub name: String, pub alive: bool, pub last_activity: String }
 
 /// Optional host binding attached to a live terminal entry (e.g. Solveit dialog path and caller scope).
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -50,7 +50,9 @@ impl TermSession {
     pub fn alive(&self) -> bool { self.core.alive() }
     pub fn last_activity(&self) -> f64 { self.core.last_activity() }
 
-    pub fn model(&self) -> TermModel { TermModel { name: self.name.clone(), alive: self.core.alive(), last_activity: self.core.last_activity() } }
+    pub fn model(&self) -> TermModel {
+        TermModel { name: self.name.clone(), alive: self.core.alive(), last_activity: crate::contents::rfc3339_secs(self.core.last_activity()) }
+    }
 
     /// Escalate SIGHUP/SIGCONT/SIGINT/SIGTERM, then SIGKILL if `force`; true once reaped (`!alive()`).
     pub async fn terminate(self: &Arc<Self>, force: bool) -> bool {
