@@ -42,3 +42,4 @@ jupygate service uninstall
 - Terminals: `GET/POST /api/terminals`, `GET/DELETE /api/terminals/{name}`, `WS /terminals/websocket/{name}` (Jupyter terminado JSON-array framing). Terminal lifetimes are independent of kernel deletions.
 - MCP: `POST /mcp` and `DELETE /mcp` (Streamable HTTP JSON-RPC with `list_kernels`, `create`, `use_kernel`, `delete_kernel`, `exec`, `restart`, `interrupt`, `/params/jupygate` session defaults, and `"jupygate": true` in the `initialize` result).
 - Contract: `GET /` returns `{"version", "cwd"}` and `GET /openapi.json` returns the public OpenAPI 3.1 schema.
+
