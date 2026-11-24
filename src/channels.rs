@@ -15,8 +15,7 @@ const MAX_FRAME: usize = 1 << 30;
 const CLOSED: &str = "kernel channels closed";
 
 pub struct KernelChannels {
-    session: Arc<Session>, outs: HashMap<&'static str, DealerWriter>, closed: CancellationToken,
-    hb_addr: String, hb: Mutex<Option<Dealer>>,
+    session: Arc<Session>, outs: HashMap<&'static str, DealerWriter>, closed: CancellationToken, hb_addr: String, hb: Mutex<Option<Dealer>>
 }
 
 /// A reserved kernel channel. Its next message is staged before the first write can suspend.
@@ -123,27 +122,18 @@ async fn wait_ready(ch: &KernelChannels, shell: &mut ChannelRx, iopub: &mut Chan
         Ok::<_, String>(msg.msg_id().to_string())
     };
     let mut probes = vec![];
-    let first = loop {
-        probes.push(probe().await?);
-        if let Some(msg) = iopub.recv_for(Duration::from_millis(500)).await? { break msg; }
-    };
+    let first = loop { probes.push(probe().await?); if let Some(msg) = iopub.recv_for(Duration::from_millis(500)).await? { break msg; } };
     if first.msg_type() == "iopub_welcome" {
         // Replies are FIFO: a final probe's reply and idle mark the end of all preceding probes on both channels.
         let id = probe().await?;
-        let reply = loop {
-            let msg = shell.recv().await?;
-            if msg.parent_id() == Some(&id) { break msg; }
-        };
+        let reply = loop { let msg = shell.recv().await?; if msg.parent_id() == Some(&id) { break msg; } };
         loop {
             let msg = iopub.recv().await?;
             if msg.parent_id() == Some(&id) && msg.msg_type() == "status" && msg.content["execution_state"] == "idle" { break; }
         }
         return Ok(reply.message.content);
     }
-    let reply = loop {
-        let msg = shell.recv().await?;
-        if msg.msg_type() == "kernel_info_reply" { break msg; }
-    };
+    let reply = loop { let msg = shell.recv().await?; if msg.msg_type() == "kernel_info_reply" { break msg; } };
     let mut outstanding = probes.len() - 1;
     while outstanding > 0 {
         let Some(msg) = shell.recv_for(Duration::from_secs(1)).await? else { break; };

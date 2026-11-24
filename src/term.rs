@@ -19,23 +19,30 @@ use tokio::sync::watch;
 #[derive(Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct TermModel { pub name: String, pub alive: bool, pub last_activity: f64 }
 
+/// Optional host binding attached to a live terminal entry (e.g. Solveit dialog path and caller scope).
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct TermBinding { pub path: Option<String>, pub scope: Option<String> }
+
 /// One pty session: the core's change hook wakes a tokio `watch` channel, which is the
 /// whole asyncio bridge - no event loop machinery crosses the thread boundary.
 pub struct TermSession {
     pub name: String,
     pub core: PtyCore,
+    pub binding: TermBinding,
     changed: watch::Sender<()>,
     /// How many websocket clients are attached
     attached: AtomicUsize,
 }
 
 impl TermSession {
-    fn new(name: &str, argv: &[String], cwd: Option<&str>, env: HashMap<String, String>, rows: u16, cols: u16) -> std::io::Result<Arc<TermSession>> {
+    fn new(
+        name: &str, argv: &[String], cwd: Option<&str>, env: HashMap<String, String>, rows: u16, cols: u16, binding: TermBinding
+    ) -> std::io::Result<Arc<TermSession>> {
         let core = PtyCore::spawn(argv, cwd, Some(&env), rows, cols, 1_000_000)?;
         let (tx, _) = watch::channel(());
         let hook = tx.clone();
         core.set_callback(Arc::new(move || { let _ = hook.send(()); }));
-        Ok(Arc::new(TermSession { name: name.into(), core, changed: tx, attached: AtomicUsize::new(0) }))
+        Ok(Arc::new(TermSession { name: name.into(), core, binding, changed: tx, attached: AtomicUsize::new(0) }))
     }
 
     pub fn subscribe(&self) -> watch::Receiver<()> { self.changed.subscribe() }
@@ -55,7 +62,7 @@ impl TermSession {
 struct RemoveDirOnDrop(Option<PathBuf>);
 impl Drop for RemoveDirOnDrop { fn drop(&mut self) { if let Some(dir) = self.0.take() { let _ = fs::remove_dir_all(dir); } } }
 
-/// Named-session registry: get-or-create by name, list, terminate.
+/// Named-session registry: get-or-create by name or binding, list, terminate.
 pub struct Terminals { terms: Arc<Mutex<HashMap<String, Arc<TermSession>>>>, argv: Vec<String>, root: PathBuf, next: AtomicUsize }
 
 fn default_argv() -> Vec<String> { vec![std::env::var("SHELL").unwrap_or_else(|_| "bash".into()), "-i".into()] }
@@ -63,11 +70,7 @@ fn default_argv() -> Vec<String> { vec![std::env::var("SHELL").unwrap_or_else(|_
 impl Terminals {
     pub fn new(root: PathBuf) -> Terminals { Terminals { terms: Arc::new(Mutex::new(HashMap::new())), argv: default_argv(), root, next: AtomicUsize::new(1) } }
 
-    /// Get a live session by `name`, or start a new one with the supplied `env`, `appendenv`, and `cwd`.
-    /// Exited sessions are removed automatically. Auto names count up and are never reused.
-    pub fn create(&self, body: TermCreateBody) -> std::io::Result<Arc<TermSession>> {
-        let mut terms = self.terms.lock().unwrap();
-        if let Some(name) = body.name.as_deref() && let Some(t) = terms.get(name) && t.core.alive() { return Ok(t.clone()); }
+    fn spawn_locked(&self, terms: &mut HashMap<String, Arc<TermSession>>, body: TermCreateBody, binding: TermBinding) -> std::io::Result<Arc<TermSession>> {
         let name = body.name.unwrap_or_else(|| {
             loop { let n = self.next.fetch_add(1, Ordering::Relaxed).to_string(); if !terms.contains_key(&n) { break n; } }
         });
@@ -88,7 +91,7 @@ impl Terminals {
         let mut full_env: HashMap<String, String> = env.unwrap_or_else(|| env::vars().collect());
         full_env.extend(appendenv.unwrap_or_default());
         let cwd = paths::process_cwd(&self.root, body.cwd.as_deref(), None)?;
-        let t = TermSession::new(&name, &argv, cwd.as_deref().and_then(|p| p.to_str()), full_env, body.rows.unwrap_or(24), body.cols.unwrap_or(80))?;
+        let t = TermSession::new(&name, &argv, cwd.as_deref().and_then(|p| p.to_str()), full_env, body.rows.unwrap_or(24), body.cols.unwrap_or(80), binding)?;
         if let Some(rcdir) = rc_guard.0.take() { t.core.set_cleanup_dir(rcdir); }
         terms.insert(name, t.clone());
         let (registry, session) = (self.terms.clone(), t.clone());
@@ -100,23 +103,58 @@ impl Terminals {
         Ok(t)
     }
 
-    pub fn get(&self, name: &str) -> Option<Arc<TermSession>> { self.terms.lock().unwrap().get(name).cloned() }
+    fn lock_live(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<TermSession>>> {
+        let mut terms = self.terms.lock().unwrap();
+        terms.retain(|_, t| t.core.alive());
+        terms
+    }
 
-    pub fn list(&self) -> Vec<Arc<TermSession>> { self.terms.lock().unwrap().values().cloned().collect() }
+    /// Get a live session by `name`, or start a new one with the supplied `env`, `appendenv`, and `cwd`.
+    /// Exited sessions are removed automatically. Auto names count up and are never reused.
+    pub fn create(&self, body: TermCreateBody) -> std::io::Result<Arc<TermSession>> {
+        let mut terms = self.lock_live();
+        if let Some(name) = body.name.as_deref() && let Some(t) = terms.get(name) { return Ok(t.clone()); }
+        self.spawn_locked(&mut terms, body, TermBinding::default())
+    }
 
-    pub fn models(&self) -> Vec<TermModel> { self.terms.lock().unwrap().values().map(|t| t.model()).collect() }
+    /// Atomically reuse a live terminal matching `(binding.path, binding.scope)` or `(name, binding.scope)`,
+    /// reject a cross-scope name collision with 409, or invoke `build` and spawn a bound terminal.
+    pub fn create_bound(
+        &self, name: Option<&str>, binding: TermBinding, build: impl FnOnce() -> Result<TermCreateBody, (StatusCode, String)>
+    ) -> Result<Arc<TermSession>, (StatusCode, String)> {
+        let mut terms = self.lock_live();
+        if let Some(p) = binding.path.as_deref()
+            && let Some(t) = terms.values().find(|t| t.binding.path.as_deref() == Some(p) && t.binding.scope == binding.scope) { return Ok(t.clone()); }
+        if let Some(n) = name && let Some(t) = terms.get(n) {
+            if t.binding.scope != binding.scope { return Err((StatusCode::CONFLICT, "terminal name belongs to another caller".into())); }
+            return Ok(t.clone());
+        }
+        let body = build()?;
+        self.spawn_locked(&mut terms, body, binding).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("terminal failed to start: {e}")))
+    }
 
-    pub async fn delete(&self, name: &str) -> bool {
-        let Some(t) = self.terms.lock().unwrap().remove(name) else { return false; };
-        t.terminate(true).await;
-        true
+    pub fn get(&self, name: &str) -> Option<Arc<TermSession>> { self.lock_live().get(name).cloned() }
+    pub fn list(&self) -> Vec<Arc<TermSession>> { self.list_matching(|_| true) }
+    pub fn list_matching(&self, pred: impl Fn(&TermSession) -> bool) -> Vec<Arc<TermSession>> {
+        self.lock_live().values().filter(|t| pred(t)).cloned().collect()
+    }
+    pub fn any_alive(&self, pred: impl Fn(&TermSession) -> bool) -> bool { self.lock_live().values().any(|t| pred(t)) }
+    pub fn models(&self) -> Vec<TermModel> { self.list().into_iter().map(|t| t.model()).collect() }
+    pub async fn delete(&self, name: &str) -> bool { self.delete_matching(|t| t.name == name).await > 0 }
+
+    pub async fn delete_matching(&self, pred: impl Fn(&TermSession) -> bool) -> usize {
+        let victims: Vec<Arc<TermSession>> = {
+            let mut terms = self.terms.lock().unwrap();
+            let names: Vec<String> = terms.iter().filter(|(_, t)| pred(t)).map(|(n, _)| n.clone()).collect();
+            names.into_iter().filter_map(|n| terms.remove(&n)).collect()
+        };
+        let n = victims.len();
+        for t in victims { t.terminate(true).await; }
+        n
     }
 
     /// Reap every terminal; nothing survives the registry.
-    pub async fn shutdown(&self) {
-        let victims: Vec<Arc<TermSession>> = self.terms.lock().unwrap().drain().map(|(_, t)| t).collect();
-        for t in victims { t.terminate(true).await; }
-    }
+    pub async fn shutdown(&self) { self.delete_matching(|_| true).await; }
 }
 
 #[derive(Default, serde::Deserialize, schemars::JsonSchema)]

@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 pub struct Msg { pub message: kernmini::Message, pub channel: String }
 
 impl Msg {
-    pub fn new(session: &Session, channel: &str, msg_type: &str, content: Value) -> Self { Self { message: session.message(msg_type, content, None), channel: channel.into() } }
+    pub fn new(session: &Session, channel: &str, msg_type: &str, content: Value) -> Self {
+        Self { message: session.message(msg_type, content, None), channel: channel.into() }
+    }
     pub fn parent_id(&self) -> Option<&str> { self.parent_header.get("msg_id").and_then(Value::as_str) }
     pub fn parent_session(&self) -> Option<&str> { self.parent_header.get("session").and_then(Value::as_str) }
     pub fn is_execute(&self) -> bool { self.channel == "shell" && self.msg_type() == "execute_request" }

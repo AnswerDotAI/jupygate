@@ -6,14 +6,93 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use std::{fs, io::Write, process, time::SystemTime, time::UNIX_EPOCH};
+use std::{env, fs, io::Write, process, time::SystemTime, time::UNIX_EPOCH};
 use tokio::time;
 use uuid::Uuid;
 
 use crate::api::err;
+use crate::mcp::Mcp;
+use crate::service::{self, ServiceMeta};
+
+/// Common command-line options shared by `jupygate` and downstream gateways.
+pub struct ServerOpts {
+    pub host: String, pub port: u16, pub port_file: Option<PathBuf>, pub token: Option<String>, pub token_file: Option<String>, pub trust_loopback: bool,
+    pub tls: bool, pub root: PathBuf, pub cull_idle: f64, pub exit_with_parent: bool
+}
+
+impl ServerOpts {
+    pub fn parse(args: impl IntoIterator<Item = String>, usage: &str) -> Result<Self, String> { Self::parse_with(args, usage, |_, _| Ok(false)) }
+
+    pub fn parse_with(
+        args: impl IntoIterator<Item = String>, usage: &str, mut extra: impl FnMut(&str, &mut dyn Iterator<Item = String>) -> Result<bool, String>
+    ) -> Result<Self, String> {
+        let root = env::current_dir().map_err(|e| format!("cannot read working directory: {e}"))?;
+        let mut o = Self { host: "127.0.0.1".into(), port: 8787, port_file: None, token: None, token_file: None, trust_loopback: false, tls: false, root,
+            cull_idle: 0.0, exit_with_parent: false };
+        let mut args = args.into_iter();
+        while let Some(a) = args.next() {
+            if extra(&a, &mut args)? { continue; }
+            let mut val = || args.next().ok_or_else(|| format!("{a} needs a value\n{usage}"));
+            match a.as_str() {
+                "--host" => o.host = val()?, "--port" => o.port = val()?.parse().map_err(|_| "--port must be a number".to_string())?,
+                "--port-file" => o.port_file = Some(val()?.into()), "--token" => o.token = Some(val()?), "--token-file" => o.token_file = Some(val()?),
+                "--trust-loopback" => o.trust_loopback = true, "--tls" => o.tls = true, "--root" => o.root = val()?.into(),
+                "--cull-idle" => o.cull_idle = val()?.parse().map_err(|_| "--cull-idle must be a number of seconds".to_string())?,
+                "--exit-with-parent" => o.exit_with_parent = true, "--help" | "-h" => { println!("{usage}"); process::exit(0) }
+                _ => return Err(format!("unknown option {a}\n{usage}"))
+            }
+        }
+        if o.token.is_some() && o.token_file.is_some() { return Err(format!("--token and --token-file are mutually exclusive\n{usage}")); }
+        Ok(o)
+    }
+
+    pub fn load_token(&self) -> Result<Option<String>, String> { load_token(self.token.as_deref(), self.token_file.as_deref()) }
+
+    pub fn bind(&self) -> std::io::Result<(std::net::TcpListener, SocketAddr, String)> {
+        let (listener, addr) = bind_listener(&self.host, self.port)?;
+        if let Some(pf) = &self.port_file { write_port_file(pf, addr.port())?; }
+        let url = format!("{}://127.0.0.1:{}", if self.tls { "https" } else { "http" }, addr.port());
+        Ok((listener, addr, url))
+    }
+}
+
+/// Handle `service ...` subcommands immediately, or return the remaining CLI arguments for server startup.
+pub fn cli_args(meta: &ServiceMeta, validate: impl Fn(&[String]) -> Result<(), String>) -> Vec<String> {
+    let mut args = env::args();
+    let program = args.next().expect("argv[0]");
+    let mut args = args.peekable();
+    if args.peek().is_some_and(|a| a == "service") {
+        args.next();
+        let rest: Vec<String> = args.collect();
+        match service::run(meta, &program, &rest, |a| validate(&a)) {
+            Ok(code) => process::exit(code),
+            Err(e) => {
+                eprintln!("{e}");
+                process::exit(2);
+            }
+        }
+    }
+    args.collect()
+}
+
+/// Run an idle-culling tick once per minute on a background task.
+pub fn spawn_cull<S: Clone + Send + 'static, Fut: Future<Output = ()> + Send + 'static>(state: S, mut tick: impl FnMut(S) -> Fut + Send + 'static) {
+    tokio::spawn(async move {
+        loop {
+            time::sleep(Duration::from_secs(60)).await;
+            tick(state.clone()).await;
+        }
+    });
+}
+
+/// Wait for the shutdown signal, then cancel any in-flight MCP requests before draining the server.
+pub async fn shutdown_with_mcp(exit_with_parent: bool, mcp: Arc<Mcp>) {
+    shutdown_signal(exit_with_parent).await;
+    mcp.cancel_all().await;
+}
 
 pub fn now() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_secs_f64() }
 

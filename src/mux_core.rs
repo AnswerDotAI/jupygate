@@ -405,13 +405,23 @@ impl MuxCore {
         self.pending_stdin.lock().unwrap().clear();
     }
 
+    /// Record `kernel_info_reply` and spawn one pump task per channel using `receive`.
+    pub fn start_pumps<F>(self: &Arc<Self>, ch: Arc<KernelChannels>, channels: Vec<ChannelRx>, info: Value, receive: F) where
+        F: Fn(&Arc<KernelChannels>, Msg) + Send + Sync + 'static {
+        self.set_info(info);
+        let receive = Arc::new(receive);
+        for rx in channels {
+            let (core, ch, receive) = (self.clone(), ch.clone(), receive.clone());
+            self.spawn_task(async move { core.pump(rx, |msg| receive(&ch, msg)).await });
+        }
+    }
+
     /// Drive one kernel channel until it closes. A lost shell or IOPub channel requires a restart.
     pub async fn pump(&self, mut rx: ChannelRx, mut receive: impl FnMut(Msg)) {
         let error = loop { match rx.recv().await { Ok(msg) => receive(msg), Err(error) => break error } };
         let reason = match rx.name {
             "shell" => "The kernel's execution channel failed. Restart the kernel to resume.",
-            "iopub" => "The kernel's output channel failed and this execution's output was lost. Restart the kernel to resume.",
-            _ => return,
+            "iopub" => "The kernel's output channel failed and this execution's output was lost. Restart the kernel to resume.", _ => return
         };
         if self.transition(ChannelState::ChannelLost { reason: reason.into() }) {
             eprintln!("kernel {} {} failed: {error}", self.kid, rx.name);
@@ -425,10 +435,8 @@ impl MuxCore {
             self.touch();
             if msg.msg_type() == "status" {
                 match (msg.content["execution_state"].as_str(), msg.parent_id()) {
-                    (Some("busy"), Some(pid)) => self.mark_busy(pid.into()),
-                    (Some("idle"), Some(pid)) => self.mark_idle(pid),
-                    (Some("dead"), _) => { self.transition(ChannelState::Dead); }
-                    _ => {}
+                    (Some("busy"), Some(pid)) => self.mark_busy(pid.into()), (Some("idle"), Some(pid)) => self.mark_idle(pid),
+                    (Some("dead"), _) => { self.transition(ChannelState::Dead); } _ => {}
                 }
             }
             self.relay_iopub(&msg);
@@ -497,10 +505,7 @@ impl MuxCore {
 
     fn fail_collectors(&self, error: &ExecError) { for (_, tx) in self.collectors.lock().unwrap().drain() { let _ = tx.send(Err(error.clone())); } }
 
-    pub fn broadcast(&self, msg: &Msg) {
-        let frame = to_frame(msg);
-        for cq in self.clients.lock().unwrap().sockets.values() { cq.put_frame(frame.clone()); }
-    }
+    pub fn broadcast(&self, msg: &Msg) { let frame = to_frame(msg); for cq in self.clients.lock().unwrap().sockets.values() { cq.put_frame(frame.clone()); } }
 
     /// Route parented iopub directly to its owning collector (and broadcast unparented/global
     /// status to all collectors), while always broadcasting to attached WebSocket frontends.
@@ -535,11 +540,23 @@ impl MuxCore {
         self.send_client(session_id, &msg);
     }
 
+    /// Reject an `execute_request` with an `execute_reply` error, optional IOPub `error`, and parented `idle`.
+    pub fn reject_execute_with(&self, session_id: &str, request: &Msg, ename: &str, error: &str, iopub_error: bool, annotate: impl Fn(&mut Msg)) {
+        self.error_reply(session_id, request, ename, error);
+        if iopub_error {
+            let mut msg = self.iopub_msg(&request.header, "error", json!({"ename": ename, "evalue": error, "traceback": []}));
+            annotate(&mut msg);
+            self.relay_iopub(&msg);
+        }
+        let mut idle = self.iopub_msg(&request.header, "status", json!({"execution_state": "idle"}));
+        annotate(&mut idle);
+        self.relay_iopub(&idle);
+    }
+
     /// Reject an `execute_request` during restart or unavailability with a standard Jupyter
     /// `execute_reply` error and parented `idle` completion status.
     pub fn reject_execute(&self, session_id: &str, request: &Msg, err: &ExecError) {
-        self.error_reply(session_id, request, err.ename(), &err.to_string());
-        self.publish(&request.header, "status", json!({"execution_state": "idle"}));
+        self.reject_execute_with(session_id, request, err.ename(), &err.to_string(), false, |_| {});
     }
 
     pub fn error_reply(&self, session_id: &str, request: &Msg, ename: &str, error: &str) {
@@ -555,6 +572,15 @@ impl MuxCore {
 
     pub async fn send(&self, ch: &KernelChannels, session_id: &str, msg: &mut Msg) -> Result<(), String> {
         self.send_reserved(ch.sender(&msg.channel).await?, session_id, msg, |_| {}).await
+    }
+
+    /// Forward a standard Jupyter client message, rejecting executes cleanly when channels are not ready.
+    pub async fn handle_message(&self, session_id: &str, mut msg: Msg) -> Result<(), String> {
+        let ch = self.ready_channels().map_err(|err| {
+            if msg.is_execute() { self.reject_execute(session_id, &msg, &err); }
+            err.to_string()
+        })?;
+        self.send(&ch, session_id, &mut msg).await
     }
 
     /// Once the writer is reserved, publish queued and stage the request without a cancellable wait between them.
@@ -578,9 +604,8 @@ impl MuxCore {
         if msg.channel != "stdin" { return; }
         let mut map = self.pending_stdin.lock().unwrap();
         let Some(q) = map.get_mut(session_id) else { return; };
-        if msg.parent_header.is_empty() {
-            if let Some(hdr) = q.pop_front() { msg.parent_header = hdr; }
-        } else if let Some(pid) = msg.parent_id() {
+        if msg.parent_header.is_empty() { if let Some(hdr) = q.pop_front() { msg.parent_header = hdr; } }
+        else if let Some(pid) = msg.parent_id() {
             if let Some(pos) = q.iter().position(|h| h.get("msg_id").and_then(Value::as_str) == Some(pid)) { q.remove(pos); }
         }
         if q.is_empty() { map.remove(session_id); }

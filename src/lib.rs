@@ -36,51 +36,11 @@ use serde_json::Value;
 use sessions::Sessions;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
-use std::{env, process, slice};
 use term::Terminals;
-use tokio::time;
 
 const USAGE: &str = "usage: jupygate [--host H] [--port N] [--port-file PATH] [--token T | --token-file PATH] [--trust-loopback] [--root DIR] [--tls] [--cull-idle SECONDS] [--exit-with-parent]";
-
-/// The server's command-line options, read by `main` and checked by `jupygate service install`.
-struct Opts {
-    host: String, port: u16, port_file: Option<PathBuf>, token: Option<String>, token_file: Option<String>, trust_loopback: bool, tls: bool, root: PathBuf,
-    cull_idle: f64, exit_with_parent: bool
-}
-
-impl Opts {
-    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
-        let root = env::current_dir().map_err(|e| format!("cannot read working directory: {e}"))?;
-        let mut o = Opts { host: "127.0.0.1".into(), port: 8787, port_file: None, token: None, token_file: None, trust_loopback: false, tls: false, root,
-            cull_idle: 0.0, exit_with_parent: false };
-        let mut args = args.into_iter();
-        while let Some(a) = args.next() {
-            let mut val = || args.next().ok_or_else(|| format!("{a} needs a value\n{USAGE}"));
-            match a.as_str() {
-                "--host" => o.host = val()?, "--port" => o.port = val()?.parse().map_err(|_| "--port must be a number".to_string())?,
-                "--port-file" => o.port_file = Some(val()?.into()), "--token" => o.token = Some(val()?), "--token-file" => o.token_file = Some(val()?),
-                "--trust-loopback" => o.trust_loopback = true, "--tls" => o.tls = true, "--root" => o.root = val()?.into(),
-                "--cull-idle" => o.cull_idle = val()?.parse().map_err(|_| "--cull-idle must be a number of seconds".to_string())?,
-                "--exit-with-parent" => o.exit_with_parent = true, "--help" | "-h" => { println!("{USAGE}"); process::exit(0) }
-                _ => return Err(format!("unknown option {a}\n{USAGE}"))
-            }
-        }
-        if o.token.is_some() && o.token_file.is_some() { return Err(format!("--token and --token-file are mutually exclusive\n{USAGE}")); }
-        Ok(o)
-    }
-}
-
-/// How long a subagent kernel may stay idle before culling stops it.
-pub const AGENT_IDLE: f64 = 1800.0;
-
-async fn cull(app: AppState, secs: f64) {
-    loop {
-        time::sleep(Duration::from_secs(60)).await;
-        for kid in app.kernels.idle(secs, |gk| gk.lifecycle.launch.agent.is_some().then_some(AGENT_IDLE)).await { app.delete_kernel(&kid).await; }
-    }
-}
 
 /// The gateway's own base URL, for its children: set once at bind, read at kernel spawn.
 pub static SELF_URL: OnceLock<String> = OnceLock::new();
@@ -93,25 +53,16 @@ pub struct AppState {
 
 impl McpHost for AppState { fn mcp(&self) -> &Mcp { &self.mcp } }
 
-fn to_mcp_kernel(m: KernelModel, agent: Option<String>) -> McpKernel {
-    McpKernel { id: m.id, name: m.name, language: m.language, execution_state: m.execution_state, connections: m.connections, path: m.path, agent }
-}
-
 impl AppState {
-    async fn add_mcp_connections(&self, models: &mut [KernelModel]) {
-        let counts = self.mcp.connection_counts().await;
-        for m in models { m.connections += counts.get(&m.id).copied().unwrap_or(0); }
-    }
-
     async fn kernel_models(&self) -> Vec<KernelModel> {
         let mut ms = self.kernels.models().await;
-        self.add_mcp_connections(&mut ms).await;
+        self.mcp.add_connections(&mut ms).await;
         ms
     }
 
     pub(crate) async fn kernel_model(&self, kid: &str) -> Option<KernelModel> {
         let mut m = self.kernels.model(kid).await?;
-        self.add_mcp_connections(slice::from_mut(&mut m)).await;
+        self.mcp.add_connections([&mut m]).await;
         Some(m)
     }
 
@@ -125,32 +76,24 @@ impl AppState {
     }
 
     pub(crate) async fn restart_kernel(&self, kid: &str) -> Option<Result<KernelModel, gateway::RestartError>> {
-        let res = self.kernels.restart(kid).await?;
-        if res.is_err() {
-            self.mcp.clear_kernel(kid).await;
-            self.sessions.remove_by_kernel(kid).await;
+        let mut res = self.kernels.restart(kid).await?;
+        match &mut res {
+            Ok(m) => self.mcp.add_connections([m]).await,
+            Err(_) => {
+                self.mcp.clear_kernel(kid).await;
+                self.sessions.remove_by_kernel(kid).await;
+            }
         }
         Some(res)
-    }
-
-    async fn mcp_kernel_of(&self, gk: &GatewayKernel) -> McpKernel {
-        let mut m = gk.model().await;
-        self.add_mcp_connections(slice::from_mut(&mut m)).await;
-        to_mcp_kernel(m, gk.lifecycle.launch.agent.clone())
     }
 }
 
 impl McpBackend for AppState {
     type Caller = ();
 
-    async fn list_kernels(&self) -> Vec<McpKernel> {
-        let mut rows = self.kernels.models_with_agents().await;
-        let counts = self.mcp.connection_counts().await;
-        for (m, _) in &mut rows { m.connections += counts.get(&m.id).copied().unwrap_or(0); }
-        rows.into_iter().map(|(m, agent)| to_mcp_kernel(m, agent)).collect()
-    }
+    async fn list_kernels(&self) -> Vec<McpKernel> { self.kernel_models().await.into_iter().map(Into::into).collect() }
 
-    async fn get_kernel(&self, kid: &str) -> Option<McpKernel> { let gk = self.kernels.get(kid).await?; Some(self.mcp_kernel_of(&gk).await) }
+    async fn get_kernel(&self, kid: &str) -> Option<McpKernel> { self.kernel_model(kid).await.map(Into::into) }
 
     async fn kernel_state(&self, kid: &str) -> Option<(String, String)> {
         let gk = self.kernels.get(kid).await?;
@@ -158,33 +101,20 @@ impl McpBackend for AppState {
     }
 
     async fn create_kernel(&self, req: McpCreate, _caller: &Self::Caller) -> Result<McpKernel, String> {
-        let specs = kernelspec::specs().await;
-        if !specs.contains_key(&req.kernel) { return Err(kernelspec::unknown(&req.kernel, &specs)); }
-        let agent = req.agent.clone();
-        let input = LaunchInput { name: Some(req.kernel), appendenv: req.appendenv, cwd: req.cwd, launcher: Some(req.launcher.into()), agent: req.agent,
-            ..LaunchInput::default() };
-        let m = self.kernels.create(input, None).await?;
-        Ok(to_mcp_kernel(m, agent))
+        Ok(self.kernels.create(req.into_launch_input().await?, None).await?.into())
     }
 
     async fn execute(
         &self, kid: &str, code: &str, _caller: &Self::Caller, cancel: &mut tokio::sync::watch::Receiver<bool>) -> Result<Vec<session::Msg>, String> {
         let gk = self.kernels.get(kid).await.ok_or("kernel disappeared")?;
-        let mux = &gk.mux;
-        gk.lifecycle.mcp_execute(code, cancel, |sid, msg| async move { mux.handle_message(&sid, msg).await }, self.kernels.interrupt(kid)).await
+        let core = gk.core();
+        gk.lifecycle.mcp_execute(code, cancel, |sid, msg| async move { core.handle_message(&sid, msg).await }, self.kernels.interrupt(kid)).await
     }
 
     async fn delete_kernel(&self, kid: &str) -> bool { self.delete_kernel(kid).await }
 
     async fn restart_kernel(&self, kid: &str, _caller: &Self::Caller) -> Option<Result<McpKernel, String>> {
-        let res = self.restart_kernel(kid).await?;
-        match res {
-            Ok(m) => {
-                let ag = self.kernels.get(&m.id).await.and_then(|gk| gk.lifecycle.launch.agent.clone());
-                Some(Ok(to_mcp_kernel(m, ag)))
-            }
-            Err(e) => Some(Err(e.into_message())),
-        }
+        Some(self.restart_kernel(kid).await?.map(Into::into).map_err(gateway::RestartError::into_message))
     }
 
     async fn interrupt_kernel(&self, kid: &str, _caller: &Self::Caller) -> Option<Result<(), String>> { self.kernels.interrupt(kid).await }
@@ -250,8 +180,8 @@ async fn channels_ws(ws: WebSocketUpgrade, headers: HeaderMap, State(app): State
 }
 
 async fn kernel_client(socket: WebSocket, kernels: Arc<Kernels>, gk: Arc<GatewayKernel>, sid: Option<String>) {
-    let kid = gk.mux.kid.clone();
-    mux_core::serve_ws(socket, gk.mux.core.clone(), sid, move |session_id, msg| {
+    let kid = gk.kid().to_string();
+    mux_core::serve_ws(socket, gk.core().clone(), sid, move |session_id, msg| {
         let (kernels, kid) = (kernels.clone(), kid.clone());
         async move { kernels.handle_msg(&kid, &session_id, msg).await }
     }).await;
@@ -288,40 +218,19 @@ fn router(app: AppState) -> Router {
 
 #[tokio::main]
 pub async fn main() {
-    let mut args = env::args();
-    let program = args.next().expect("argv[0]");
-    let mut args = args.peekable();
-    if args.peek().is_some_and(|a| a == "service") {
-        args.next();
-        let args = args.collect::<Vec<_>>();
-        match service::run(&service::JUPYGATE, &program, &args, |a| Opts::parse(a).map(|_| ())) {
-            Ok(code) => process::exit(code),
-            Err(e) => {
-                eprintln!("{e}");
-                process::exit(2);
-            }
-        }
-    }
-    let o = Opts::parse(args).unwrap_or_else(|e| { eprintln!("{e}"); process::exit(2) });
-    let token = server::load_token(o.token.as_deref(), o.token_file.as_deref()).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        process::exit(2)
-    });
+    let args = server::cli_args(&service::JUPYGATE, |a| server::ServerOpts::parse(a.iter().cloned(), USAGE).map(|_| ()));
+    let o = server::ServerOpts::parse(args, USAGE).unwrap_or_else(|e| { eprintln!("{e}"); process::exit(2) });
+    let token = o.load_token().unwrap_or_else(|e| { eprintln!("{e}"); process::exit(2) });
     let root = std::path::absolute(&o.root).expect("absolute served root");
     let kernels = Arc::new(Kernels::new(root.clone()));
     let sessions = Arc::new(Sessions::new());
     let terminals = Arc::new(Terminals::new(root.clone()));
     let app = AppState { kernels, sessions, terminals, mcp: Arc::new(Mcp::default()), token, trust_loopback: o.trust_loopback, root: Arc::new(root) };
-    let (std_listener, addr) = server::bind_listener(&o.host, o.port).expect("bind failed");
-    if let Some(pf) = &o.port_file { server::write_port_file(pf, addr.port()).expect("write port file"); }
-    let scheme = if o.tls { "https" } else { "http" };
-    SELF_URL.set(format!("{scheme}://127.0.0.1:{}", addr.port())).expect("set once");
-    tokio::spawn(cull(app.clone(), o.cull_idle));
-    let mcp = app.mcp.clone();
-    let signal = async move {
-        server::shutdown_signal(o.exit_with_parent).await;
-        mcp.cancel_all().await;
-    };
+    let (std_listener, _addr, self_url) = o.bind().expect("bind failed");
+    SELF_URL.set(self_url).expect("set once");
+    let cull_idle = o.cull_idle;
+    server::spawn_cull(app.clone(), move |a| async move { for kid in a.kernels.idle(cull_idle).await { a.delete_kernel(&kid).await; } });
+    let signal = server::shutdown_with_mcp(o.exit_with_parent, app.mcp.clone());
     server::serve_router(std_listener, o.tls, &o.host, router(app.clone()), signal).await;
     app.kernels.shutdown().await;
     app.terminals.shutdown().await;

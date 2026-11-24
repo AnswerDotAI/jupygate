@@ -6,8 +6,7 @@ use axum::response::{IntoResponse, Json, Response};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 
 use crate::api::Body;
@@ -20,14 +19,24 @@ const PROTOCOLS: [&str; 2] = ["2025-11-25", "2025-06-18"];
 
 /// The subset of a kernel model that MCP exposes and tracks.
 #[derive(Clone, Debug)]
-pub struct McpKernel {
-    pub id: String, pub name: String, pub language: String, pub execution_state: String, pub connections: usize, pub path: Option<String>,
-    pub agent: Option<String>
+pub struct McpKernel { pub id: String, pub name: String, pub language: String, pub execution_state: String, pub connections: usize, pub path: Option<String> }
+
+impl From<crate::gateway::KernelModel> for McpKernel {
+    fn from(m: crate::gateway::KernelModel) -> Self {
+        Self { id: m.id, name: m.name, language: m.language, execution_state: m.execution_state, connections: m.connections, path: m.path }
+    }
 }
 
 /// Parameters MCP passes to the gateway backend when creating a kernel.
-pub struct McpCreate {
-    pub kernel: String, pub cwd: Option<String>, pub appendenv: Option<HashMap<String, String>>, pub launcher: &'static str, pub agent: Option<String>
+pub struct McpCreate { pub kernel: String, pub cwd: Option<String>, pub appendenv: Option<HashMap<String, String>>, pub launcher: &'static str }
+
+impl McpCreate {
+    pub async fn into_launch_input(self) -> Result<crate::gateway::LaunchInput, String> {
+        let specs = kernelspec::specs().await;
+        if !specs.contains_key(&self.kernel) { return Err(kernelspec::unknown(&self.kernel, &specs)); }
+        Ok(crate::gateway::LaunchInput { name: Some(self.kernel), appendenv: self.appendenv, cwd: self.cwd, launcher: Some(self.launcher.into()),
+            ..Default::default() })
+    }
 }
 
 /// Minimal gateway kernel operations required by `/mcp` (shared by `jupygate` and `rustygate`).
@@ -53,28 +62,16 @@ pub trait McpBackend: Send + Sync {
     fn interrupt_kernel(&self, kid: &str, caller: &Self::Caller) -> impl Future<Output = Option<Result<(), String>>> + Send;
 }
 
-/// Per-caller selection, autoclose ownership, and first-exec provisioning lock within a transport session.
-#[derive(Default)]
-struct CallerState { current: Option<String>, made: HashMap<String, bool>, init_lock: Arc<Mutex<()>> }
-
 struct McpSession {
-    defaults: Defaults, protocol: String, inflight: HashMap<String, watch::Sender<bool>>, session_cancel: watch::Sender<bool>, main: CallerState,
-    agents: HashMap<String, CallerState>
+    defaults: Defaults, protocol: String, inflight: HashMap<String, watch::Sender<bool>>, session_cancel: watch::Sender<bool>, current: Option<String>,
+    made: HashMap<String, bool>
 }
 
 impl McpSession {
     fn new(defaults: Defaults, protocol: &str) -> Self {
         let (session_cancel, _) = watch::channel(false);
-        Self { defaults, protocol: protocol.to_string(), inflight: HashMap::new(), session_cancel, main: CallerState::default(), agents: HashMap::new() }
+        Self { defaults, protocol: protocol.to_string(), inflight: HashMap::new(), session_cancel, current: None, made: HashMap::new() }
     }
-
-    fn caller(&self, agent: Option<&str>) -> Option<&CallerState> { match agent { None => Some(&self.main), Some(a) => self.agents.get(a) } }
-
-    fn caller_mut(&mut self, agent: Option<&str>) -> &mut CallerState {
-        match agent { None => &mut self.main, Some(a) => self.agents.entry(a.to_string()).or_default() }
-    }
-
-    fn is_made(&self, kid: &str) -> bool { self.main.made.contains_key(kid) || self.agents.values().any(|a| a.made.contains_key(kid)) }
 }
 
 /// Per-session kernel-creation defaults, sent by the client as a `jupygate` extension field
@@ -87,12 +84,10 @@ fn defaults_of(v: &Value) -> Defaults {
     Defaults { cwd: v["cwd"].as_str().map(String::from), env, startup: v["startup"].as_str().map(String::from), quiet: v["quiet"].as_bool().unwrap_or(false) }
 }
 
-/// MCP transport sessions, each containing its main caller and nested per-subagent callers.
-/// The current-kernel pointer lives here, never in model-visible tool arguments.
+/// MCP transport sessions. The current-kernel pointer lives here, never in model-visible tool arguments.
 pub struct Mcp { sessions: RwLock<HashMap<String, McpSession>>, server_name: &'static str, server_version: &'static str }
 
 impl Default for Mcp { fn default() -> Self { Self::new("jupygate", env!("CARGO_PKG_VERSION")) } }
-
 fn rpc_result(id: Value, result: Value) -> Value { json!({"jsonrpc": "2.0", "id": id, "result": result}) }
 
 fn rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
@@ -255,8 +250,6 @@ pub fn startup_error(msgs: &[Msg]) -> Option<String> {
     Some(format!("startup failed; the kernel was stopped:\n{text}"))
 }
 
-/// The note that opens a subagent's reply when its `exec` started a kernel for it.
-const AGENT_KERNEL: &str = "New kernel for this subagent: names from any other kernel, the parent's included, aren't defined here.";
 const NO_CURRENT: &str = "no current kernel: call create or use_kernel first";
 
 impl Mcp {
@@ -264,12 +257,13 @@ impl Mcp {
 
     pub async fn connection_counts(&self) -> HashMap<String, usize> {
         let mut counts = HashMap::<String, usize>::new();
-        let sessions = self.sessions.read().await;
-        for s in sessions.values() {
-            if let Some(kid) = s.main.current.as_deref() { *counts.entry(kid.to_string()).or_default() += 1; }
-            for a in s.agents.values() { if let Some(kid) = a.current.as_deref() { *counts.entry(kid.to_string()).or_default() += 1; } }
-        }
+        for s in self.sessions.read().await.values() { if let Some(kid) = s.current.as_deref() { *counts.entry(kid.to_string()).or_default() += 1; } }
         counts
+    }
+
+    pub async fn add_connections<'a>(&self, models: impl IntoIterator<Item = &'a mut crate::gateway::KernelModel>) {
+        let counts = self.connection_counts().await;
+        for m in models { m.connections += counts.get(&m.id).copied().unwrap_or(0); }
     }
 
     async fn initialize_session(&self, known: Option<&str>, protocol: &str, defaults: Defaults) -> String {
@@ -284,22 +278,19 @@ impl Mcp {
         sid
     }
 
-    /// Forget transport session `sid` and all its nested subagent callers. Returns the kernels they
-    /// created with autoclose, or `None` for an unknown session.
+    /// Forget transport session `sid`. Returns the kernels it created with autoclose, or `None` if unknown.
     async fn end_session(&self, sid: &str) -> Option<Vec<String>> {
         let s = self.sessions.write().await.remove(sid)?;
         let _ = s.session_cancel.send(true);
         for (_, tx) in s.inflight { let _ = tx.send(true); }
-        let main_kids = s.main.made.into_iter().filter_map(|(kid, auto)| auto.then_some(kid));
-        let agent_kids = s.agents.into_values().flat_map(|a| a.made).filter_map(|(kid, auto)| auto.then_some(kid));
-        Some(main_kids.chain(agent_kids).collect())
+        Some(s.made.into_iter().filter_map(|(kid, auto)| auto.then_some(kid)).collect())
     }
 
     async fn protocol(&self, sid: &str) -> Option<String> { self.sessions.read().await.get(sid).map(|s| s.protocol.clone()) }
 
     async fn session_cancel(&self, sid: &str) -> Option<watch::Receiver<bool>> { self.sessions.read().await.get(sid).map(|s| s.session_cancel.subscribe()) }
 
-    async fn is_made(&self, sid: &str, kid: &str) -> bool { self.sessions.read().await.get(sid).is_some_and(|s| s.is_made(kid)) }
+    async fn is_made(&self, sid: &str, kid: &str) -> bool { self.sessions.read().await.get(sid).is_some_and(|s| s.made.contains_key(kid)) }
 
     async fn begin_request(&self, sid: &str, request: &str) -> watch::Receiver<bool> {
         let (tx, rx) = watch::channel(false);
@@ -326,46 +317,32 @@ impl Mcp {
         }
     }
 
-    async fn current(&self, sid: &str, agent: Option<&str>) -> Option<String> {
-        self.sessions.read().await.get(sid).and_then(|s| s.caller(agent)).and_then(|c| c.current.clone())
-    }
+    async fn current(&self, sid: &str) -> Option<String> { self.sessions.read().await.get(sid).and_then(|s| s.current.clone()) }
 
-    async fn select(&self, sid: &str, agent: Option<&str>, kid: &str) {
-        if let Some(s) = self.sessions.write().await.get_mut(sid) { s.caller_mut(agent).current = Some(kid.to_string()); }
-    }
-
-    async fn agent_init_lock(&self, sid: &str, agent: &str) -> Option<Arc<Mutex<()>>> {
-        let mut sessions = self.sessions.write().await;
-        let s = sessions.get_mut(sid)?;
-        Some(s.caller_mut(Some(agent)).init_lock.clone())
-    }
+    async fn select(&self, sid: &str, kid: &str) { if let Some(s) = self.sessions.write().await.get_mut(sid) { s.current = Some(kid.to_string()); } }
 
     pub async fn clear_kernel(&self, kid: &str) {
         for s in self.sessions.write().await.values_mut() {
-            if s.main.current.as_deref() == Some(kid) { s.main.current = None; }
-            s.main.made.remove(kid);
-            for a in s.agents.values_mut() {
-                if a.current.as_deref() == Some(kid) { a.current = None; }
-                a.made.remove(kid);
-            }
+            if s.current.as_deref() == Some(kid) { s.current = None; }
+            s.made.remove(kid);
         }
     }
 
     async fn defaults(&self, sid: &str) -> Defaults { self.sessions.read().await.get(sid).map(|s| s.defaults.clone()).unwrap_or_default() }
 
     /// Record kernel ownership if the session is still active; returns `false` if `DELETE /mcp` ended it concurrently.
-    async fn record_made(&self, sid: &str, agent: Option<&str>, kid: &str, autoclose: bool) -> bool {
+    async fn record_made(&self, sid: &str, kid: &str, autoclose: bool) -> bool {
         let mut sessions = self.sessions.write().await;
         let Some(s) = sessions.get_mut(sid) else { return false; };
-        s.caller_mut(agent).made.insert(kid.to_string(), autoclose);
+        s.made.insert(kid.to_string(), autoclose);
         true
     }
 
     /// Resolve a lifecycle tool's target kernel ID: explicit selectors list & match; omitted
-    /// selectors read the caller's current ID directly without listing unrelated kernels.
-    async fn target_id<B: McpBackend>(&self, backend: &B, sid: &str, agent: Option<&str>, selector: Option<&str>) -> Result<String, String> {
+    /// selectors read the session's current ID directly without listing unrelated kernels.
+    async fn target_id<B: McpBackend>(&self, backend: &B, sid: &str, selector: Option<&str>) -> Result<String, String> {
         if let Some(sel) = selector { return resolve_kernel(backend, sel, false).await.map(|m| m.id); }
-        let kid = self.current(sid, agent).await.ok_or(NO_CURRENT)?;
+        let kid = self.current(sid).await.ok_or(NO_CURRENT)?;
         if backend.kernel_state(&kid).await.is_none() { self.clear_kernel(&kid).await; return Err(NO_CURRENT.into()); }
         Ok(kid)
     }
@@ -379,101 +356,75 @@ impl Mcp {
         match startup_error(&msgs) { Some(err) => Err(err), None => Ok(msgs) }
     }
 
-    /// Create a kernel for `(sid, agent)`, run MCP session Python startup if configured, record it
+    /// Create a kernel for `sid`, run MCP session Python startup if configured, record it
     /// for autoclose, then select it. Returns `(kid, rendered_blocks)`.
     async fn open<B: McpBackend>(
-        &self, backend: &B, sid: &str, agent: Option<&str>, kernel: &str, autoclose: bool, cwd: Option<&str>, caller: &B::Caller
-    ) -> Result<(String, Vec<Value>), String> {
+        &self, backend: &B, sid: &str, kernel: &str, autoclose: bool, cwd: Option<&str>, caller: &B::Caller) -> Result<(String, Vec<Value>), String> {
         let d = self.defaults(sid).await;
-        let req = McpCreate { kernel: kernel.to_string(), cwd: cwd.map(String::from).or_else(|| d.cwd.clone()), appendenv: d.env.clone(), launcher: "mcp",
-            agent: agent.map(String::from) };
+        let req = McpCreate { kernel: kernel.to_string(), cwd: cwd.map(String::from).or_else(|| d.cwd.clone()), appendenv: d.env.clone(), launcher: "mcp" };
         let m = backend.create_kernel(req, caller).await?;
         let startup_msgs = match self.run_startup(backend, sid, &m, caller).await {
             Ok(msgs) => msgs, Err(e) => { backend.delete_kernel(&m.id).await; return Err(e); }
         };
-        if !self.record_made(sid, agent, &m.id, autoclose).await {
-            if autoclose { backend.delete_kernel(&m.id).await; }
-            return Err("MCP session ended".into());
-        }
-        self.select(sid, agent, &m.id).await;
+        if !self.record_made(sid, &m.id, autoclose).await { if autoclose { backend.delete_kernel(&m.id).await; } return Err("MCP session ended".into()); }
+        self.select(sid, &m.id).await;
         let startup = if d.quiet { vec![] } else { render_output(&startup_msgs) };
         let blocks = stacked([vec![text_block(kernel_reply("created", &m))], startup].concat());
         Ok((m.id, blocks))
     }
 
-    /// Run `code` directly on the caller's current kernel ID.
-    /// A subagent with no current kernel serializes first establishment and uses its returned ID.
+    /// Run `code` directly on the session's current kernel ID.
     async fn execute<B: McpBackend>(
-        &self, backend: &B, sid: &str, agent: Option<&str>, args: &Map<String, Value>, cwd: Option<&str>, cancel: &mut watch::Receiver<bool>, caller: &B::Caller
-    ) -> Result<Value, String> {
+        &self, backend: &B, sid: &str, args: &Map<String, Value>, cancel: &mut watch::Receiver<bool>, caller: &B::Caller) -> Result<Value, String> {
         let code = arg(args, "code")?.ok_or("missing required argument code")?;
-        let mut opened = vec![];
-        let existing = match self.current(sid, agent).await {
-            Some(kid) => match backend.kernel_state(&kid).await {
-                Some((_, state)) => { if !live_state(&state) { return Err(format!("kernel {kid} is {state}")); } Some(kid) }
-                None => { self.clear_kernel(&kid).await; None }
-            },
-            None => None,
-        };
-        let kid = match (existing, agent) {
-            (Some(kid), _) => kid,
-            (None, None) => return Err(NO_CURRENT.into()),
-            (None, Some(a)) => {
-                let lock = self.agent_init_lock(sid, a).await.ok_or("MCP session ended")?;
-                let _guard = lock.lock().await;
-                if let Some(kid) = self.current(sid, Some(a)).await && let Some((_, state)) = backend.kernel_state(&kid).await {
-                    if !live_state(&state) { return Err(format!("kernel {kid} is {state}")); }
-                    kid
-                } else {
-                    let parent_kid = self.current(sid, None).await.ok_or(NO_CURRENT)?;
-                    let (kernel, _) = backend.kernel_state(&parent_kid).await.ok_or(NO_CURRENT)?;
-                    let (kid, blocks) = self.open(backend, sid, Some(a), &kernel, true, cwd, caller).await?;
-                    opened = [vec![text_block(AGENT_KERNEL)], blocks].concat();
-                    kid
-                }
-            }
-        };
+        let kid = self.current(sid).await.ok_or(NO_CURRENT)?;
+        match backend.kernel_state(&kid).await {
+            Some((_, state)) if !live_state(&state) => return Err(format!("kernel {kid} is {state}")),
+            None => { self.clear_kernel(&kid).await; return Err(NO_CURRENT.into()); } Some(_) => {}
+        }
         let output = backend.execute(&kid, code, caller, cancel).await?;
-        Ok(tool_result(stacked(opened.into_iter().chain(render_output(&output))), false))
+        Ok(tool_result(render_output(&output), false))
     }
 
     async fn call_tool<B: McpBackend>(
-        &self, backend: &B, sid: &str, agent: Option<&str>, name: &str, args: &Map<String, Value>, cwd: Option<&str>,
-        cancel: Option<&mut watch::Receiver<bool>>, caller: &B::Caller) -> Result<Value, String> {
+        &self, backend: &B, sid: &str, name: &str, args: &Map<String, Value>, cwd: Option<&str>, cancel: Option<&mut watch::Receiver<bool>>, caller: &B::Caller
+    ) -> Result<Value, String> {
         match name {
             "list_kernels" => {
-                let current = self.current(sid, agent).await;
+                let current = self.current(sid).await;
                 let mut ms = backend.list_kernels().await;
                 ms.sort_by(|a, b| a.id.cmp(&b.id));
                 if ms.is_empty() { return Ok(text_result("no kernels")); }
                 let lines = ms.into_iter().map(|m| {
                     let path = m.path.as_deref().map(|p| format!("  path={p}")).unwrap_or_default();
-                    let ag = m.agent.as_deref().map(|a| format!("  agent={a}")).unwrap_or_default();
                     let cur = if current.as_deref() == Some(&m.id) { "  <- current" } else { "" };
-                    format!("{}  {}  kernel={}  language={}  connections={}{path}{ag}{cur}", m.id, m.execution_state, m.name, m.language, m.connections)
-                }).collect::<Vec<_>>().join("\n");
+                    format!("{}  {}  kernel={}  language={}  connections={}{path}{cur}", m.id, m.execution_state, m.name, m.language, m.connections)
+                }).collect::<Vec<_>>().join(
+                        "
+",
+                    );
                 Ok(text_result(lines))
             }
             "create" => {
                 let kernel = required_arg(args, "kernel")?;
                 let autoclose = bool_arg(args, "autoclose")?.unwrap_or(true);
-                let (_, blocks) = self.open(backend, sid, agent, kernel, autoclose, cwd, caller).await?;
+                let (_, blocks) = self.open(backend, sid, kernel, autoclose, cwd, caller).await?;
                 Ok(tool_result(blocks, false))
             }
             "use_kernel" => {
                 let m = resolve_kernel(backend, required_arg(args, "kernel")?, true).await?;
-                self.select(sid, agent, &m.id).await;
+                self.select(sid, &m.id).await;
                 Ok(text_result(kernel_reply("current", &m)))
             }
             "delete_kernel" => {
-                let kid = self.target_id(backend, sid, agent, arg(args, "kernel")?).await?;
+                let kid = self.target_id(backend, sid, arg(args, "kernel")?).await?;
                 if !backend.delete_kernel(&kid).await { return Err("kernel disappeared".into()); }
                 self.clear_kernel(&kid).await;
                 Ok(text_result(format!("deleted kernel {kid}")))
             }
-            "exec" => self.execute(backend, sid, agent, args, cwd, cancel.expect("execution calls register cancellation"), caller).await,
+            "exec" => self.execute(backend, sid, args, cancel.expect("execution calls register cancellation"), caller).await,
             "restart" => {
-                let kid = self.target_id(backend, sid, agent, arg(args, "kernel")?).await?;
+                let kid = self.target_id(backend, sid, arg(args, "kernel")?).await?;
                 let quiet = self.defaults(sid).await.quiet;
                 let owned = self.is_made(sid, &kid).await;
                 match backend.restart_kernel(&kid, caller).await {
@@ -487,7 +438,7 @@ impl Mcp {
                 }
             }
             "interrupt" => {
-                let kid = self.target_id(backend, sid, agent, arg(args, "kernel")?).await?;
+                let kid = self.target_id(backend, sid, arg(args, "kernel")?).await?;
                 backend.interrupt_kernel(&kid, caller).await.ok_or("kernel disappeared")??;
                 Ok(text_result(format!("interrupt sent to kernel {kid}")))
             }
@@ -535,11 +486,6 @@ impl Mcp {
             "tools/call" => {
                 let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or("");
                 let mut args = msg.pointer("/params/arguments").and_then(Value::as_object).cloned().unwrap_or_default();
-                let agent = match arg(&args, "agent") {
-                    Ok(a) => a.filter(|a| !a.is_empty()).map(String::from),
-                    Err(e) => return json_response(StatusCode::OK, rpc_result(id, error_result(e)), None),
-                };
-                args.remove("agent");
                 let cwd = match arg(&args, "cwd") {
                     Ok(c) => c.filter(|c| !c.is_empty()).map(String::from),
                     Err(e) => return json_response(StatusCode::OK, rpc_result(id, error_result(e)), None),
@@ -551,7 +497,7 @@ impl Mcp {
                     (true, None) => return json_response(StatusCode::BAD_REQUEST, rpc_error(id, -32600, "tools/call needs a string or number id"), None),
                     (false, _) => None,
                 };
-                let result = self.call_tool(backend, sid, agent.as_deref(), name, &args, cwd.as_deref(), cancel.as_mut(), &caller).await;
+                let result = self.call_tool(backend, sid, name, &args, cwd.as_deref(), cancel.as_mut(), &caller).await;
                 if let Some(request) = &request && cancel.is_some() { self.end_request(sid, request).await; }
                 if cancel.as_ref().is_some_and(|rx| *rx.borrow()) { return StatusCode::ACCEPTED.into_response(); }
                 let result = match result { Ok(v) => v, Err(e) => error_result(e) };

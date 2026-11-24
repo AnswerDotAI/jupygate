@@ -31,15 +31,24 @@ pub fn decode_bytes(content: &str, format: Option<&str>) -> Result<Vec<u8>, Stri
     }
 }
 
-/// Write via a hidden sibling temp file, then rename over `path`, creating missing parents.
-/// Removes the temp file if writing or renaming fails.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Write via a hidden sibling temp file, capture its metadata from the open file handle before
+/// rename, then atomically replace `path`, creating missing parents. Removes the temp file on failure.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<fs::Metadata> {
+    use std::io::Write;
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = path.with_file_name(format!(".{fname}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    if let Err(e) = fs::write(&tmp, bytes) { let _ = fs::remove_file(&tmp); return Err(e); }
-    if let Err(e) = fs::rename(&tmp, path) { let _ = fs::remove_file(&tmp); return Err(e); }
-    Ok(())
+    let res = (|| -> io::Result<fs::Metadata> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        let md = f.metadata()?;
+        drop(f);
+        fs::rename(&tmp, path)?;
+        Ok(md)
+    })();
+    if res.is_err() { let _ = fs::remove_file(&tmp); }
+    res
 }
 
 /// `abs` itself if free, else the first free `stem_n.ext` (n = 1, 2, ...).
@@ -384,67 +393,12 @@ async fn delete_path(State(app): State<AppState>, AxPath(rel): AxPath<String>) -
     match delete_disk(&app.root, &rel) { Ok(()) => StatusCode::NO_CONTENT.into_response(), Err((code, msg)) => err(code, &msg) }
 }
 
-pub fn routes() -> crate::openapi::RouteSet<AppState> {
-    use crate::openapi::{Route, RouteSet, schema_of};
-    use axum::routing::get;
-    RouteSet { router: axum::Router::new().route("/api/contents", get(get_root).post(post_root))
-            .route("/api/contents/{*path}", get(get_path).put(put_path).patch(patch_path).post(post_path).delete(delete_path)), routes: vec![
-                Route {
-                    method: "get",
-                    path: "/api/contents",
-                    handler: concat!(module_path!(), "::get_root"),
-                    public: true,
-                    query: Some(schema_of::<GetQ>),
-                    body: None,
-                    ret: Some(schema_of::<ContentsModel>),
-                }, Route {
-                    method: "post",
-                    path: "/api/contents",
-                    handler: concat!(module_path!(), "::post_root"),
-                    public: true,
-                    query: None,
-                    body: Some(schema_of::<PostBody>),
-                    ret: Some(schema_of::<ContentsModel>),
-                }, Route {
-                    method: "get",
-                    path: "/api/contents/{*path}",
-                    handler: concat!(module_path!(), "::get_path"),
-                    public: true,
-                    query: Some(schema_of::<GetQ>),
-                    body: None,
-                    ret: Some(schema_of::<ContentsModel>),
-                }, Route {
-                    method: "put",
-                    path: "/api/contents/{*path}",
-                    handler: concat!(module_path!(), "::put_path"),
-                    public: true,
-                    query: None,
-                    body: Some(schema_of::<PutBody>),
-                    ret: Some(schema_of::<ContentsModel>),
-                }, Route {
-                    method: "patch",
-                    path: "/api/contents/{*path}",
-                    handler: concat!(module_path!(), "::patch_path"),
-                    public: true,
-                    query: None,
-                    body: Some(schema_of::<PatchBody>),
-                    ret: Some(schema_of::<ContentsModel>),
-                }, Route {
-                    method: "post",
-                    path: "/api/contents/{*path}",
-                    handler: concat!(module_path!(), "::post_path"),
-                    public: true,
-                    query: None,
-                    body: Some(schema_of::<PostBody>),
-                    ret: Some(schema_of::<ContentsModel>),
-                }, Route {
-                    method: "delete",
-                    path: "/api/contents/{*path}",
-                    handler: concat!(module_path!(), "::delete_path"),
-                    public: true,
-                    query: None,
-                    body: None,
-                    ret: None,
-                },
-            ] }
+crate::routes! {
+    pub get "/api/contents" => get_root query(GetQ) ret(ContentsModel),
+    pub post "/api/contents" => post_root body(PostBody) ret(ContentsModel),
+    pub get "/api/contents/{*path}" => get_path query(GetQ) ret(ContentsModel),
+    pub put "/api/contents/{*path}" => put_path body(PutBody) ret(ContentsModel),
+    pub patch "/api/contents/{*path}" => patch_path body(PatchBody) ret(ContentsModel),
+    pub post "/api/contents/{*path}" => post_path body(PostBody) ret(ContentsModel),
+    pub delete "/api/contents/{*path}" => delete_path,
 }

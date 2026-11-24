@@ -2,8 +2,8 @@
 
 use axum::http::StatusCode;
 use kernmini::ConnectionInfo;
-use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +15,7 @@ pub use tokio_util::sync::CancellationToken;
 pub use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
-use crate::channels::{ChannelRx, KernelChannels};
+use crate::channels::KernelChannels;
 use crate::kernelspec;
 use crate::mux_core::{ChannelState, MuxCore};
 use crate::paths;
@@ -31,7 +31,12 @@ pub type StartResult = Result<KernelModel, (StatusCode, String)>;
 #[derive(Clone, Default)]
 pub struct LaunchInput {
     pub name: Option<String>, pub argv: Option<Vec<String>>, pub env: Option<HashMap<String, String>>, pub appendenv: Option<HashMap<String, String>>,
-    pub cwd: Option<String>, pub cull_idle: Option<f64>, pub launcher: Option<String>, pub agent: Option<String>
+    pub cwd: Option<String>, pub cull_idle: Option<f64>, pub launcher: Option<String>
+}
+
+/// Typed per-spawn inputs supplied by the host on initial start and every restart.
+pub struct SpawnContext {
+    pub path: Option<String>, pub self_url: Option<String>, pub caller_secrets: Option<HashMap<String, String>>, pub conn_prefix: &'static str
 }
 
 /// Resolved kernel launch recipe: fixed at creation and replayed on every restart.
@@ -50,7 +55,6 @@ pub struct Launch {
     pub message_interrupt: bool,
     pub cull_idle: Option<f64>,
     pub launcher: Option<String>,
-    pub agent: Option<String>,
 }
 
 impl Launch {
@@ -68,25 +72,23 @@ impl Launch {
         if argv.is_empty() { return Err(std::io::Error::other("kernel argv is empty")); }
         let cull_idle = input.cull_idle.filter(|&s| s.is_finite() && s > 0.0);
         Ok(Self { name, argv, ks_env, env: input.env, appendenv: input.appendenv.unwrap_or_default(), cwd: input.cwd, message_interrupt, cull_idle,
-            launcher: input.launcher, agent: input.agent })
+            launcher: input.launcher })
     }
 
     /// Spawn a process from this recipe with per-spawn path, gateway URL, and optional caller secrets.
     /// Precedence: base (`env` or inherited) -> `ks_env` -> `caller_secrets` -> `appendenv` -> `JUPYGATE_*`.
-    pub fn spawn(
-        &self, root: &Path, path: Option<&str>, kid: &str, self_url: Option<&str>, caller_secrets: Option<&HashMap<String, String>>, conn_prefix: &str
-    ) -> std::io::Result<KernelProc> {
-        let cwd = paths::process_cwd(root, self.cwd.as_deref(), path)?;
+    pub fn spawn_with(&self, root: &Path, kid: &str, ctx: &SpawnContext) -> std::io::Result<KernelProc> {
+        let cwd = paths::process_cwd(root, self.cwd.as_deref(), ctx.path.as_deref())?;
         let mut appendenv = self.ks_env.clone();
-        if let Some(secrets) = caller_secrets { appendenv.extend(secrets.iter().map(|(k, v)| (k.clone(), v.clone()))); }
+        if let Some(secrets) = ctx.caller_secrets.as_ref() { appendenv.extend(secrets.iter().map(|(k, v)| (k.clone(), v.clone()))); }
         appendenv.extend(self.appendenv.iter().map(|(k, v)| (k.clone(), v.clone())));
-        let url = self_url.or_else(|| crate::SELF_URL.get().map(String::as_str));
+        let url = ctx.self_url.as_deref().or_else(|| crate::SELF_URL.get().map(String::as_str));
         let extra = [
-            ("JUPYGATE_URL", url), ("JUPYGATE_KERNEL_ID", Some(kid)), ("JUPYGATE_KERNEL_PATH", path), ("JUPYGATE_LAUNCHER", self.launcher.as_deref()),
-            ("JUPYGATE_AGENT", self.agent.as_deref()),
+            ("JUPYGATE_URL", url), ("JUPYGATE_KERNEL_ID", Some(kid)), ("JUPYGATE_KERNEL_PATH", ctx.path.as_deref()),
+            ("JUPYGATE_LAUNCHER", self.launcher.as_deref()),
         ];
         KernelProc::spawn(&SpawnOpts { argv: &self.argv, env: self.env.as_ref(), appendenv: Some(&appendenv), extra_env: &extra,
-            cwd: cwd.as_deref().and_then(|p| p.to_str()), conn_prefix })
+            cwd: cwd.as_deref().and_then(|p| p.to_str()), conn_prefix: ctx.conn_prefix })
     }
 }
 
@@ -147,8 +149,7 @@ impl KernelLifecycle {
     /// Serialize MCP calls, cancelling a waiting submit without interrupting another client's execution.
     pub async fn mcp_execute<F: Future<Output = Result<(), String>>>(
         &self, code: &str, cancel: &mut tokio::sync::watch::Receiver<bool>, send: impl FnOnce(String, Msg) -> F,
-        interrupt: impl Future<Output = Option<Result<(), String>>>,
-    ) -> Result<Vec<Msg>, String> {
+        interrupt: impl Future<Output = Option<Result<(), String>>>) -> Result<Vec<Msg>, String> {
         let _exec = tokio::select! {
             biased;
             _ = cancel.wait_for(|v| *v) => return Err("request cancelled".into()),
@@ -178,6 +179,14 @@ impl KernelLifecycle {
 
     pub async fn pid(&self) -> u32 { self.proc_.lock().await.as_ref().map_or(0, KernelProc::pid) }
     pub async fn last_heartbeat(&self) -> Option<f64> { *self.last_beat.lock().await }
+
+    /// Build the base Jupyter `KernelModel` snapshot for this kernel.
+    pub async fn model(&self, path: Option<String>) -> KernelModel {
+        KernelModel { id: self.core.kid.clone(), name: self.launch.name.clone(), language: self.core.language(),
+            execution_state: self.execution_state().await.to_string(), unresponsive: self.unresponsive(), execution_lost: self.execution_lost(),
+            connections: self.core.n_attached(), pid: self.pid().await, last_heartbeat: self.last_heartbeat().await, last_activity: self.core.last_activity(),
+            path }
+    }
 
     /// Mark the kernel `dead` and broadcast the synthesized `dead` status.
     pub async fn mark_dead(&self) {
@@ -247,43 +256,23 @@ async fn watch_lifecycle(lc: Arc<KernelLifecycle>) {
     if *lc.phase.lock().await == LifecyclePhase::Running { lc.mark_dead().await; }
 }
 
-/// A standalone gateway kernel with standard Jupyter message delivery.
-pub struct KernelMux { pub core: Arc<MuxCore>, pub kid: String, path: std::sync::Mutex<Option<String>> }
-
-impl KernelMux {
-    pub fn new(qmax: usize, path: Option<String>, kid: String) -> Arc<Self> {
-        let core = MuxCore::new(kid.clone(), qmax, "jupygate");
-        Arc::new(Self { core, kid, path: std::sync::Mutex::new(path) })
-    }
-
-    pub fn path(&self) -> Option<String> { self.path.lock().unwrap().clone() }
-
-    fn start(self: &Arc<Self>, channels: Vec<ChannelRx>, info: Value) {
-        self.core.set_info(info);
-        for rx in channels {
-            let core = self.core.clone();
-            self.core.spawn_task(async move { core.pump(rx, |msg| core.deliver(msg)).await });
-        }
-    }
-
-    pub async fn handle_message(&self, session_id: &str, mut msg: Msg) -> Result<(), String> {
-        let ch = self.core.ready_channels().map_err(|err| {
-            if msg.is_execute() { self.core.reject_execute(session_id, &msg, &err); }
-            err.to_string()
-        })?;
-        self.core.send(&ch, session_id, &mut msg).await
-    }
+/// Product-specific attachment owned alongside a `KernelLifecycle` inside `KernelPool`.
+pub trait KernelEntry: Send + Sync + Sized + 'static {
+    fn core(&self) -> &Arc<MuxCore>;
+    fn spawn_context(&self) -> std::io::Result<SpawnContext>;
+    fn on_message(self: &Arc<Self>, _ch: &Arc<KernelChannels>, msg: Msg) { self.core().deliver(msg); }
+    fn init(self: &Arc<Self>, _ch: Arc<KernelChannels>) -> impl Future<Output = Result<(), String>> + Send { async { Ok(()) } }
+    fn on_stop_channels(&self) {}
+    fn on_close(self: &Arc<Self>) -> impl Future<Output = ()> + Send { async {} }
 }
 
-async fn start_channels(conn: &ConnectionInfo, mux: &Arc<KernelMux>) -> Result<Arc<KernelChannels>, String> {
-    let (ch, rx, info) = KernelChannels::connect(conn, "jupygate", START_TIMEOUT).await?;
-    mux.core.transition(ChannelState::Initializing(Some(ch.clone())));
-    mux.start(rx, info);
-    Ok(ch)
-}
+/// A live kernel process plus its `KernelLifecycle` and host-specific entry.
+pub struct ManagedKernel<E> { pub lifecycle: Arc<KernelLifecycle>, pub entry: Arc<E> }
 
-/// A kernel process plus its channel set and mux, as one lifecycle.
-pub struct GatewayKernel { pub lifecycle: Arc<KernelLifecycle>, pub mux: Arc<KernelMux> }
+impl<E> ManagedKernel<E> {
+    pub fn kid(&self) -> &str { &self.lifecycle.core.kid }
+    pub fn core(&self) -> &Arc<MuxCore> { &self.lifecycle.core }
+}
 
 #[derive(Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct KernelModel {
@@ -291,23 +280,15 @@ pub struct KernelModel {
     pub connections: usize, pub pid: u32, pub last_heartbeat: Option<f64>, pub last_activity: f64, pub path: Option<String>
 }
 
-impl GatewayKernel {
-    pub async fn model(&self) -> KernelModel {
-        KernelModel { id: self.mux.kid.clone(), name: self.lifecycle.launch.name.clone(), language: self.mux.core.language(),
-            execution_state: self.lifecycle.execution_state().await.to_string(), unresponsive: self.lifecycle.unresponsive(),
-            execution_lost: self.lifecycle.execution_lost(), connections: self.mux.core.n_attached(), pid: self.lifecycle.pid().await,
-            last_heartbeat: self.lifecycle.last_heartbeat().await, last_activity: self.mux.core.last_activity(), path: self.mux.path() }
-    }
-}
-
-/// Abort pump tasks and close channels if an async `create` future is dropped before publication.
-struct CloseMuxOnDrop(Option<Arc<MuxCore>>);
-impl CloseMuxOnDrop { fn disarm(&mut self) { self.0 = None; } }
-impl Drop for CloseMuxOnDrop {
+/// Abort pump tasks and run close cleanup if an async `create` future is dropped before publication.
+struct AbortCreateGuard<E: KernelEntry> { teardowns: TaskTracker, entry: Option<Arc<E>> }
+impl<E: KernelEntry> AbortCreateGuard<E> { fn disarm(&mut self) { self.entry = None; } }
+impl<E: KernelEntry> Drop for AbortCreateGuard<E> {
     fn drop(&mut self) {
-        if let Some(core) = self.0.take() {
-            core.transition(ChannelState::Dead);
-            core.abort_tasks();
+        if let Some(entry) = self.entry.take() {
+            entry.core().transition(ChannelState::Dead);
+            entry.core().abort_tasks();
+            self.teardowns.spawn(async move { close_entry(&entry).await; });
         }
     }
 }
@@ -317,180 +298,212 @@ async fn reap_proc(mut proc_guard: ReapOnDrop) {
     let mut proc_ = proc_guard.take();
     let _ = task::spawn_blocking(move || proc_.terminate()).await;
 }
-/// All live kernels, keyed solely by kernel ID. Path-based reuse belongs in `/api/sessions`.
-pub struct Kernels { kernels: RwLock<HashMap<String, Arc<GatewayKernel>>>, teardowns: TaskTracker, shutdown: CancellationToken, root: PathBuf, qmax: usize }
 
-impl Kernels {
-    pub fn new(root: PathBuf) -> Self {
-        Self { kernels: RwLock::new(HashMap::new()), teardowns: TaskTracker::new(), shutdown: CancellationToken::new(), root, qmax: 1000 }
+async fn stop_entry_channels<E: KernelEntry>(entry: &Arc<E>) {
+    entry.core().stop_channels().await;
+    entry.on_stop_channels();
+}
+
+async fn close_entry<E: KernelEntry>(entry: &Arc<E>) {
+    entry.core().close().await;
+    entry.on_close().await;
+}
+
+async fn shutdown_kernel<E: KernelEntry>(gk: &ManagedKernel<E>) { gk.lifecycle.shutdown_with(close_entry(&gk.entry)).await; }
+
+enum BringUpError { Cancelled, Respawn(String), Ready(String) }
+
+async fn connect_and_init<E: KernelEntry>(conn: &ConnectionInfo, username: &str, entry: &Arc<E>) -> Result<Arc<KernelChannels>, String> {
+    let ready = async {
+        let (ch, rx, info) = KernelChannels::connect(conn, username, START_TIMEOUT).await?;
+        entry.core().transition(ChannelState::Initializing(Some(ch.clone())));
+        let e = entry.clone();
+        entry.core().start_pumps(ch.clone(), rx, info, move |ch, msg| e.on_message(ch, msg));
+        entry.init(ch.clone()).await?;
+        Ok(ch)
+    };
+    time::timeout(START_TIMEOUT, ready).await.map_err(|_| "kernel startup timed out".to_string())?
+}
+
+/// Spawn one kernel generation, connect/init channels under `START_TIMEOUT`, and reap synchronously on error or cancellation.
+async fn bring_up<E: KernelEntry>(
+    root: &Path, kid: &str, username: &str, launch: &Launch, entry: &Arc<E>, cancel: &CancellationToken
+) -> Result<(ReapOnDrop, Arc<KernelChannels>, Option<String>), BringUpError> {
+    let (entry_c, launch_c, root, kid_c) = (entry.clone(), launch.clone(), root.to_path_buf(), kid.to_string());
+    let spawn_res = task::spawn_blocking(move || {
+        let ctx = entry_c.spawn_context()?;
+        let proc_ = launch_c.spawn_with(&root, &kid_c, &ctx)?;
+        Ok::<_, std::io::Error>((ReapOnDrop::new(proc_), ctx.path))
+    }).await.expect("spawn task panicked");
+    let (proc_guard, spawned_path) = spawn_res.map_err(|e| BringUpError::Respawn(e.to_string()))?;
+    if cancel.is_cancelled() { reap_proc(proc_guard).await; return Err(BringUpError::Cancelled); }
+    let conn_info = proc_guard.as_ref().unwrap().info().clone();
+    let ch = tokio::select! {
+        res = connect_and_init(&conn_info, username, entry) => match res {
+            Ok(ch) => ch,
+            Err(e) => {
+                stop_entry_channels(entry).await;
+                reap_proc(proc_guard).await;
+                return Err(BringUpError::Ready(e));
+            }
+        },
+        _ = cancel.cancelled() => {
+            entry.core().transition(ChannelState::Dead);
+            stop_entry_channels(entry).await;
+            reap_proc(proc_guard).await;
+            return Err(BringUpError::Cancelled);
+        }
+    };
+    Ok((proc_guard, ch, spawned_path))
+}
+
+/// Concrete owner of live kernel entries, process lifecycle, cancellation, and teardown.
+pub struct KernelPool<E: KernelEntry> {
+    kernels: RwLock<HashMap<String, Arc<ManagedKernel<E>>>>, teardowns: TaskTracker, shutdown: CancellationToken, root: PathBuf, qmax: usize,
+    username: &'static str
+}
+
+impl<E: KernelEntry> KernelPool<E> {
+    pub fn new(root: PathBuf, username: &'static str) -> Self {
+        Self { kernels: RwLock::new(HashMap::new()), teardowns: TaskTracker::new(), shutdown: CancellationToken::new(), root, qmax: 1000, username }
     }
 
-    /// Spawn a new independent kernel, wait until ready, and publish it under a fresh ID.
-    pub async fn create(&self, input: LaunchInput, path: Option<String>) -> Result<KernelModel, String> {
-        if self.shutdown.is_cancelled() { return Err("gateway shutting down".into()); }
-        let id = Uuid::new_v4().simple().to_string();
-        let mux = KernelMux::new(self.qmax, path.clone(), id.clone());
-        let mut mux_guard = CloseMuxOnDrop(Some(mux.core.clone()));
-        let (root, kid, path_c) = (self.root.clone(), id.clone(), path.clone());
-        let (proc_guard, launch) = task::spawn_blocking(move || {
-            let launch = Launch::resolve(input)?;
-            let proc_ = launch.spawn(&root, path_c.as_deref(), &kid, None, None, "jupygate")?;
-            Ok::<_, std::io::Error>((ReapOnDrop::new(proc_), launch))
-        }).await.expect("spawn task panicked").map_err(|e| e.to_string())?;
-        let conn_info = proc_guard.as_ref().unwrap().info().clone();
-        let ch = tokio::select! {
-            res = start_channels(&conn_info, &mux) => match res {
-                Ok(chans) => chans,
-                Err(e) => {
-                    mux_guard.disarm();
-                    mux.core.close().await;
-                    reap_proc(proc_guard).await;
-                    return Err(e);
-                }
-            },
-            _ = self.shutdown.cancelled() => {
-                mux_guard.disarm();
-                mux.core.close().await;
-                reap_proc(proc_guard).await;
-                return Err("gateway shutting down".into());
+    pub fn root(&self) -> &Path { &self.root }
+    pub fn qmax(&self) -> usize { self.qmax }
+    pub fn is_shutting_down(&self) -> bool { self.shutdown.is_cancelled() }
+
+    pub async fn get(&self, kid: &str) -> Option<Arc<ManagedKernel<E>>> { self.kernels.read().await.get(kid).cloned() }
+
+    pub async fn list(&self) -> Vec<Arc<ManagedKernel<E>>> { self.kernels.read().await.values().cloned().collect() }
+
+    pub async fn find(&self, pred: impl Fn(&ManagedKernel<E>) -> bool) -> Vec<Arc<ManagedKernel<E>>> {
+        self.kernels.read().await.values().filter(|gk| pred(gk)).cloned().collect()
+    }
+
+    pub async fn idle(&self, secs: f64, protected: impl Fn(&ManagedKernel<E>, f64) -> bool) -> Vec<String> {
+        let t = now();
+        self.kernels.read().await.values().filter(|gk| {
+            let Some(cutoff) = cull_cutoff(t, secs, gk.lifecycle.cull_idle, None) else { return false };
+            should_cull(gk.core().last_activity(), cutoff, gk.core().busy(), protected(gk, cutoff))
+        }).map(|gk| gk.kid().to_string()).collect()
+    }
+
+    async fn teardown(gk: Arc<ManagedKernel<E>>) {
+        let _guard = gk.lifecycle.restart_lock.lock().await;
+        shutdown_kernel(&gk).await;
+    }
+
+    async fn remove_failed_restart(&self, kid: &str, gk: &Arc<ManagedKernel<E>>) {
+        let mut map = self.kernels.write().await;
+        if map.get(kid).is_some_and(|cur| Arc::ptr_eq(cur, gk)) { map.remove(kid); }
+        drop(map);
+        shutdown_kernel(gk).await;
+    }
+
+    /// Spawn, connect/initialize, transition to `Ready`, publish into the pool, and start heartbeat watching.
+    pub async fn create(&self, id: String, launch: Launch, entry: Arc<E>) -> Result<Arc<ManagedKernel<E>>, String> {
+        if self.shutdown.is_cancelled() { close_entry(&entry).await; return Err("gateway shutting down".into()); }
+        let mut guard = AbortCreateGuard { teardowns: self.teardowns.clone(), entry: Some(entry.clone()) };
+        let (mut proc_guard, ch, _) = match bring_up(&self.root, &id, self.username, &launch, &entry, &self.shutdown).await {
+            Ok(ok) => ok,
+            Err(e) => {
+                guard.disarm();
+                close_entry(&entry).await;
+                return Err(match e { BringUpError::Cancelled => "gateway shutting down".into(), BringUpError::Respawn(s) | BringUpError::Ready(s) => s });
             }
         };
-        if !mux.core.transition(ChannelState::Ready(ch)) {
-            mux_guard.disarm();
-            mux.core.close().await;
+        if !entry.core().transition(ChannelState::Ready(ch)) {
+            guard.disarm();
+            close_entry(&entry).await;
             reap_proc(proc_guard).await;
             return Err("kernel channels lost during startup".into());
         }
-        let mut proc_guard = proc_guard;
         let proc_ = proc_guard.take();
-        mux_guard.disarm();
-        let lifecycle = KernelLifecycle::new(launch, proc_, mux.core.clone());
-        let gk = Arc::new(GatewayKernel { lifecycle: lifecycle.clone(), mux });
+        let lifecycle = KernelLifecycle::new(launch, proc_, entry.core().clone());
+        let gk = Arc::new(ManagedKernel { lifecycle: lifecycle.clone(), entry });
         {
             let mut map = self.kernels.write().await;
             if self.shutdown.is_cancelled() {
                 drop(map);
-                gk.lifecycle.shutdown().await;
+                guard.disarm();
+                shutdown_kernel(&gk).await;
                 return Err("gateway shutting down".into());
             }
+            guard.disarm();
             map.insert(id, gk.clone());
         }
         lifecycle.start_watcher().await;
-        Ok(gk.model().await)
+        Ok(gk)
     }
 
-    pub async fn get(&self, kid: &str) -> Option<Arc<GatewayKernel>> { self.kernels.read().await.get(kid).cloned() }
-
-    pub async fn model(&self, kid: &str) -> Option<KernelModel> { match self.get(kid).await { Some(gk) => Some(gk.model().await), None => None } }
-
-    pub async fn models(&self) -> Vec<KernelModel> {
-        let gks: Vec<_> = self.kernels.read().await.values().cloned().collect();
-        let mut out = Vec::with_capacity(gks.len());
-        for gk in gks { out.push(gk.model().await); }
-        out
-    }
-
-    pub async fn models_with_agents(&self) -> Vec<(KernelModel, Option<String>)> {
-        let gks: Vec<_> = self.kernels.read().await.values().cloned().collect();
-        let mut out = Vec::with_capacity(gks.len());
-        for gk in gks { out.push((gk.model().await, gk.lifecycle.launch.agent.clone())); }
-        out
-    }
-
-    pub async fn idle(&self, secs: f64, extra: impl Fn(&GatewayKernel) -> Option<f64>) -> Vec<String> {
-        let t = now();
-        self.kernels.read().await.values().filter(|gk| {
-            let Some(cutoff) = cull_cutoff(t, secs, gk.lifecycle.cull_idle, extra(gk)) else { return false };
-            should_cull(gk.mux.core.last_activity(), cutoff, gk.mux.core.busy(), false)
-        }).map(|gk| gk.mux.kid.clone()).collect()
-    }
-
-    /// Delete `kid`: cancels any in-flight restart immediately so deletion never blocks on startup.
-    pub async fn delete(&self, kid: &str) -> bool {
+    /// Remove `kid`, cancel any in-flight restart, and shut down its process/channels/entry.
+    pub async fn delete(&self, kid: &str) -> Option<Arc<ManagedKernel<E>>> {
         let gk = {
             let mut map = self.kernels.write().await;
-            let Some(gk) = map.remove(kid) else { return false; };
+            let gk = map.remove(kid)?;
             gk.lifecycle.mark_deleted();
             gk
         };
-        let lc = gk.lifecycle.clone();
-        let _ = self.teardowns.spawn(async move {
-            let _guard = lc.restart_lock.lock().await;
-            lc.shutdown().await;
-        }).await;
-        true
+        let _ = self.teardowns.spawn(Self::teardown(gk.clone())).await;
+        Some(gk)
     }
 
-    pub async fn interrupt(self: &Arc<Self>, kid: &str) -> Option<Result<(), String>> {
-        let gk = self.get(kid).await?;
-        if gk.mux.core.supports("interrupt requires restart") { return self.restart(kid).await.map(|r| r.map(|_| ()).map_err(RestartError::into_message)); }
-        Some(gk.lifecycle.interrupt().await)
+    /// Remove and tear down any dead kernels matching `pred`.
+    pub async fn remove_dead(&self, pred: impl Fn(&ManagedKernel<E>) -> bool) {
+        let candidates = self.find(pred).await;
+        let mut dead = vec![];
+        for gk in candidates { if gk.lifecycle.is_dead().await { dead.push(gk.kid().to_string()); } }
+        for id in dead {
+            let gk = {
+                let mut map = self.kernels.write().await;
+                let Some(gk) = map.get(&id).cloned() else { continue; };
+                if !gk.lifecycle.is_dead().await { continue; }
+                map.remove(&id);
+                gk.lifecycle.mark_deleted();
+                gk
+            };
+            let _ = self.teardowns.spawn(Self::teardown(gk)).await;
+        }
     }
 
-    pub async fn handle_msg(self: &Arc<Self>, kid: &str, session_id: &str, msg: Msg) -> Result<(), String> {
-        let gk = self.get(kid).await.ok_or("no such kernel")?;
-        if msg.channel == "control" && msg.msg_type() == "interrupt_request" && gk.mux.core.supports("interrupt requires restart") {
-            let result = self.interrupt(kid).await.ok_or("no such kernel")?;
-            gk.mux.core.interrupt_reply(session_id, &msg, &result);
-            result
-        } else { gk.mux.handle_message(session_id, msg).await }
-    }
-
-    async fn remove_failed_restart(&self, kid: &str, gk: &Arc<GatewayKernel>) {
-        let mut map = self.kernels.write().await;
-        if map.get(kid).is_some_and(|cur| Arc::ptr_eq(cur, gk)) { map.remove(kid); }
-        drop(map);
-        gk.lifecycle.shutdown().await;
-    }
-
-    async fn run_restart(&self, kid: &str) -> Option<Result<KernelModel, RestartError>> {
-        let gk = self.get(kid).await?;
+    async fn run_restart<S, FBefore, FutBefore, FAfter, FutAfter>(
+        &self, gk: Arc<ManagedKernel<E>>, kid: &str, before_respawn: FBefore, after_ready: FAfter) -> Option<Result<Arc<ManagedKernel<E>>, RestartError>> where
+        FBefore: FnOnce(&Arc<ManagedKernel<E>>) -> FutBefore, FutBefore: Future<Output = S>,
+        FAfter: FnOnce(&Arc<ManagedKernel<E>>, Option<String>, S) -> FutAfter, FutAfter: Future<Output = ()> {
         let _restarting = gk.lifecycle.restart_lock.lock().await;
         if gk.lifecycle.is_deleted() || self.get(kid).await.is_none() { return None; }
-        let path = gk.mux.path();
-        gk.mux.core.transition(ChannelState::Initializing(None));
+        gk.core().transition(ChannelState::Initializing(None));
         gk.lifecycle.set_phase(LifecyclePhase::Restarting).await;
-        gk.mux.core.synthesize_status("restarting");
-        gk.mux.core.stop_channels().await;
+        gk.core().synthesize_status("restarting");
+        stop_entry_channels(&gk.entry).await;
+        let state = before_respawn(&gk).await;
         gk.lifecycle.abort_watcher().await;
         gk.lifecycle.terminate_proc().await;
         if gk.lifecycle.is_deleted() { return None; }
-
-        let (launch, root, kid_c, path_c) = (gk.lifecycle.launch.clone(), self.root.clone(), gk.mux.kid.clone(), path.clone());
-        let spawn_res = task::spawn_blocking(move || launch.spawn(&root, path_c.as_deref(), &kid_c, None, None, "jupygate").map(ReapOnDrop::new)).await
-            .expect("spawn task panicked");
-        let mut proc_guard = match spawn_res {
-            Ok(g) => g, Err(e) => { self.remove_failed_restart(kid, &gk).await; return Some(Err(RestartError::Respawn(format!("respawn failed: {e}")))); }
-        };
-        if gk.lifecycle.is_deleted() { reap_proc(proc_guard).await; return None; }
-        let info = proc_guard.as_ref().unwrap().info().clone();
-        let ch = tokio::select! {
-            res = start_channels(&info, &gk.mux) => match res {
-                Ok(ch) => ch,
-                Err(e) => {
-                    gk.mux.core.stop_channels().await;
-                    reap_proc(proc_guard).await;
-                    self.remove_failed_restart(kid, &gk).await;
-                    return Some(Err(RestartError::Ready(format!("kernel not ready after respawn: {e}"))));
-                }
-            },
-            _ = gk.lifecycle.cancelled() => {
-                gk.mux.core.stop_channels().await;
-                reap_proc(proc_guard).await;
-                return None;
+        let (mut proc_guard, ch, spawned_path) = match bring_up(&self.root, kid, self.username, &gk.lifecycle.launch, &gk.entry, &gk.lifecycle.deleted).await {
+            Ok(ok) => ok,
+            Err(BringUpError::Cancelled) => return None,
+            Err(BringUpError::Respawn(e)) => {
+                self.remove_failed_restart(kid, &gk).await;
+                return Some(Err(RestartError::Respawn(format!("respawn failed: {e}"))));
+            }
+            Err(BringUpError::Ready(e)) => {
+                self.remove_failed_restart(kid, &gk).await;
+                return Some(Err(RestartError::Ready(format!("kernel not ready after respawn: {e}"))));
             }
         };
         {
             let map = self.kernels.read().await;
             if gk.lifecycle.is_deleted() || !map.contains_key(kid) {
                 drop(map);
-                gk.mux.core.stop_channels().await;
+                gk.core().transition(ChannelState::Dead);
+                stop_entry_channels(&gk.entry).await;
                 reap_proc(proc_guard).await;
                 return None;
             }
-            if !gk.mux.core.transition(ChannelState::Ready(ch)) {
+            if !gk.core().transition(ChannelState::Ready(ch)) {
                 drop(map);
-                gk.mux.core.stop_channels().await;
+                stop_entry_channels(&gk.entry).await;
                 reap_proc(proc_guard).await;
                 self.remove_failed_restart(kid, &gk).await;
                 return Some(Err(RestartError::Ready("kernel channels lost during restart".into())));
@@ -498,34 +511,110 @@ impl Kernels {
             gk.lifecycle.replace_proc(proc_guard.take()).await;
             gk.lifecycle.set_phase(LifecyclePhase::Running).await;
         }
-        gk.mux.core.synthesize_status("starting");
+        gk.core().synthesize_status("starting");
         gk.lifecycle.start_watcher().await;
-        Some(Ok(gk.model().await))
+        after_ready(&gk, spawned_path, state).await;
+        Some(Ok(gk.clone()))
     }
 
-    /// Plain stock Jupyter restart: terminate and respawn under the same ID while keeping client queues.
-    pub async fn restart(self: &Arc<Self>, kid: &str) -> Option<Result<KernelModel, RestartError>> {
+    /// Terminate and respawn on the pool's teardown tracker so caller disconnect cannot abandon the transition.
+    pub async fn restart_with<S, FBefore, FutBefore, FAfter, FutAfter>(
+        self: &Arc<Self>, kid: &str, before_respawn: FBefore, after_ready: FAfter) -> Option<Result<Arc<ManagedKernel<E>>, RestartError>> where
+        S: Send + 'static, FBefore: FnOnce(&Arc<ManagedKernel<E>>) -> FutBefore + Send + 'static, FutBefore: Future<Output = S> + Send,
+        FAfter: FnOnce(&Arc<ManagedKernel<E>>, Option<String>, S) -> FutAfter + Send + 'static, FutAfter: Future<Output = ()> + Send {
+        let gk = self.get(kid).await?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let this = self.clone();
-        let kid = kid.to_string();
+        let (this, kid) = (self.clone(), kid.to_string());
         self.teardowns.spawn(async move {
-            let res = this.run_restart(&kid).await;
+            let res = this.run_restart(gk, &kid, before_respawn, after_ready).await;
             let _ = tx.send(res);
         });
         rx.await.ok().flatten()
     }
 
+    pub async fn restart(self: &Arc<Self>, kid: &str) -> Option<Result<Arc<ManagedKernel<E>>, RestartError>> {
+        self.restart_with(kid, |_| async {}, |_, _, ()| async {}).await
+    }
+
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
         let gks: Vec<_> = { let mut map = self.kernels.write().await; map.drain().map(|(_, gk)| { gk.lifecycle.mark_deleted(); gk }).collect() };
-        for gk in gks {
-            let lc = gk.lifecycle.clone();
-            self.teardowns.spawn(async move {
-                let _guard = lc.restart_lock.lock().await;
-                lc.shutdown().await;
-            });
-        }
+        for gk in gks { self.teardowns.spawn(Self::teardown(gk)); }
         self.teardowns.close();
         self.teardowns.wait().await;
     }
+}
+
+/// Standalone gateway kernel entry with standard Jupyter message delivery.
+pub struct KernelMux { pub core: Arc<MuxCore>, path: std::sync::Mutex<Option<String>> }
+
+impl KernelMux {
+    pub fn new(qmax: usize, path: Option<String>, kid: String) -> Arc<Self> {
+        Arc::new(Self { core: MuxCore::new(kid, qmax, "jupygate"), path: std::sync::Mutex::new(path) })
+    }
+
+    pub fn path(&self) -> Option<String> { self.path.lock().unwrap().clone() }
+}
+
+impl KernelEntry for KernelMux {
+    fn core(&self) -> &Arc<MuxCore> { &self.core }
+    fn spawn_context(&self) -> std::io::Result<SpawnContext> {
+        Ok(SpawnContext { path: self.path(), self_url: None, caller_secrets: None, conn_prefix: "jupygate" })
+    }
+}
+
+pub type GatewayKernel = ManagedKernel<KernelMux>;
+
+impl GatewayKernel { pub async fn model(&self) -> KernelModel { self.lifecycle.model(self.entry.path()).await } }
+
+/// All live standalone kernels, keyed solely by kernel ID. Path-based reuse belongs in `/api/sessions`.
+pub struct Kernels { pool: Arc<KernelPool<KernelMux>> }
+
+impl Kernels {
+    pub fn new(root: PathBuf) -> Self { Self { pool: Arc::new(KernelPool::new(root, "jupygate")) } }
+
+    /// Spawn a new independent kernel, wait until ready, and publish it under a fresh ID.
+    pub async fn create(&self, input: LaunchInput, path: Option<String>) -> Result<KernelModel, String> {
+        if self.pool.is_shutting_down() { return Err("gateway shutting down".into()); }
+        let launch = task::spawn_blocking(move || Launch::resolve(input)).await.expect("resolve task panicked").map_err(|e| e.to_string())?;
+        let id = Uuid::new_v4().simple().to_string();
+        let entry = KernelMux::new(self.pool.qmax(), path, id.clone());
+        Ok(self.pool.create(id, launch, entry).await?.model().await)
+    }
+
+    pub async fn get(&self, kid: &str) -> Option<Arc<GatewayKernel>> { self.pool.get(kid).await }
+
+    pub async fn model(&self, kid: &str) -> Option<KernelModel> { match self.get(kid).await { Some(gk) => Some(gk.model().await), None => None } }
+
+    pub async fn models(&self) -> Vec<KernelModel> {
+        let gks = self.pool.list().await;
+        let mut out = Vec::with_capacity(gks.len());
+        for gk in gks { out.push(gk.model().await); }
+        out
+    }
+
+    pub async fn idle(&self, secs: f64) -> Vec<String> { self.pool.idle(secs, |_, _| false).await }
+
+    pub async fn delete(&self, kid: &str) -> bool { self.pool.delete(kid).await.is_some() }
+
+    pub async fn interrupt(self: &Arc<Self>, kid: &str) -> Option<Result<(), String>> {
+        let gk = self.get(kid).await?;
+        if gk.core().supports("interrupt requires restart") { return self.restart(kid).await.map(|r| r.map(|_| ()).map_err(RestartError::into_message)); }
+        Some(gk.lifecycle.interrupt().await)
+    }
+
+    pub async fn handle_msg(self: &Arc<Self>, kid: &str, session_id: &str, msg: Msg) -> Result<(), String> {
+        let gk = self.get(kid).await.ok_or("no such kernel")?;
+        if msg.channel == "control" && msg.msg_type() == "interrupt_request" && gk.core().supports("interrupt requires restart") {
+            let result = self.interrupt(kid).await.ok_or("no such kernel")?;
+            gk.core().interrupt_reply(session_id, &msg, &result);
+            result
+        } else { gk.core().handle_message(session_id, msg).await }
+    }
+
+    pub async fn restart(self: &Arc<Self>, kid: &str) -> Option<Result<KernelModel, RestartError>> {
+        match self.pool.restart(kid).await? { Ok(gk) => Some(Ok(gk.model().await)), Err(e) => Some(Err(e)) }
+    }
+
+    pub async fn shutdown(&self) { self.pool.shutdown().await; }
 }

@@ -197,41 +197,6 @@ def test_mcp_large_output(gateway):
         assert stream_out.startswith('[') and 'bytes of output removed]' in stream_out and '3999 ' in stream_out and len(stream_out.encode()) <= (1<<20)
     finally: _close(gateway, sid)
 
-
-def test_mcp_agent_story(gateway):
-    "A tool call's `agent` argument gives that subagent its own session within the transport session, sets `JUPYGATE_AGENT` across restarts, and stops with the transport session."
-    new = 'New kernel for this subagent'
-    sid = _session(gateway, defaults=dict(startup="from IPython.display import display\nboot = 41\ndisplay({'text/plain': 'agent-doc'}, raw=True, metadata={'full': True})"))
-    try:
-        main = _call(gateway, sid, 'create', kernel='py').split()[2]
-        _call(gateway, sid, 'exec', code='x = 1')
-        out = _call(gateway, sid, 'exec', code='boot + 1', agent='a')
-        assert out.startswith('𝍁'+new) and '\ncreated kernel ' in out and out.endswith('42𝍁'), out
-        a = out.split('created kernel ')[1].split()[0]
-        assert a != main and 'NameError' in _call(gateway, sid, 'exec', code='x', agent='a')
-        assert _call(gateway, sid, 'exec', code='x = 2; x', agent='a') == '2'
-        assert _call(gateway, sid, 'exec', code='x') == '1', 'an agent changed the transport session kernel'
-        b = _call(gateway, sid, 'exec', code='1', agent='b').split('created kernel ')[1].split()[0]
-        lines = {l.split()[0]: l for l in _call(gateway, sid, 'list_kernels', agent='a').splitlines()}
-        assert lines[a].endswith('agent=a  <- current') and lines[b].endswith('agent=b') and 'agent=' not in lines[main]
-        env = "import os; print(os.environ.get('JUPYGATE_AGENT', 'unset'))"
-        assert _call(gateway, sid, 'exec', code=env, agent='a') == 'a\n' and _call(gateway, sid, 'exec', code=env) == 'unset\n'
-        assert _call(gateway, sid, 'restart', agent='a').startswith(f'𝍁restarted kernel {a}')
-        assert _call(gateway, sid, 'exec', code=env, agent='a') == 'a\n', 'a restart dropped the agent'
-        _call(gateway, sid, 'delete_kernel', agent='a')
-        out = _call(gateway, sid, 'exec', code='boot', agent='a')
-        assert out.startswith('𝍁'+new) and out.endswith('41𝍁'), out
-        a2 = out.split('created kernel ')[1].split()[0]
-        httpx.delete(f'{gateway}/api/kernels/{a2}', timeout=30).raise_for_status()
-        out = _call(gateway, sid, 'exec', code='boot', agent='a')
-        assert out.startswith('𝍁'+new) and out.endswith('41𝍁'), out
-        a2 = out.split('created kernel ')[1].split()[0]
-        assert _call(gateway, sid, 'exec', code='x') == '1', "an agent's restart or deletion reached the transport session kernel"
-        _close(gateway, sid)
-        assert not _kernels(gateway) & {main, b, a2}, "a kernel outlived its transport session"
-    finally: httpx.delete(f'{gateway}/mcp', headers={'Mcp-Session-Id': sid}, timeout=30)
-
-
 async def test_mcp_cancellation_and_interrupt(gateway):
     "Cancelling a queued request leaves the running cell alone. Cancelling the running request, or calling `interrupt`, stops its cell. The kernel keeps its state."
     loop = 'import asyncio\nwhile True: await asyncio.sleep(0.02)'
@@ -278,18 +243,16 @@ def test_mcp_cwd_override(gateway, tmp_path):
     "An unlisted `cwd` argument overrides the session default `cwd` for kernels created by that call and survives restart, without altering session defaults."
     d_default = (tmp_path / 'default').resolve()
     d_create = (tmp_path / 'create').resolve()
-    d_agent = (tmp_path / 'agent').resolve()
-    for d in (d_default, d_create, d_agent): d.mkdir()
+    d_other = (tmp_path / 'other').resolve()
+    for d in (d_default, d_create, d_other): d.mkdir()
     sid = _session(gateway, defaults=dict(cwd=str(d_default)))
     try:
         _call(gateway, sid, 'create', kernel='py', cwd=str(d_create))
         assert _call(gateway, sid, 'exec', code='import os; os.getcwd()') == str(d_create)
-        assert _call(gateway, sid, 'restart', cwd=str(d_agent)).startswith('restarted kernel ')
+        assert _call(gateway, sid, 'restart', cwd=str(d_other)).startswith('restarted kernel ')
         assert _call(gateway, sid, 'exec', code='import os; os.getcwd()') == str(d_create)
         _call(gateway, sid, 'create', kernel='py', cwd='')
         assert _call(gateway, sid, 'exec', code='import os; os.getcwd()') == str(d_default)
         assert _call(gateway, sid, 'list_kernels', cwd=str(d_create))
-        out = _call(gateway, sid, 'exec', code='import os; os.getcwd()', agent='sub', cwd=str(d_agent))
-        assert out.endswith(str(d_agent)), out
         assert 'cwd must be a string' in _call(gateway, sid, 'create', error=True, kernel='py', cwd=123)
     finally: _close(gateway, sid)
