@@ -62,4 +62,8 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
-      - run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

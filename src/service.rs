@@ -248,7 +248,8 @@ fn control(meta: &ServiceMeta, action: &str) -> Result<i32> {
         (Manager::Launchd, "restart") if launchd_loaded(meta) => checked(Command::new("launchctl").args(["kickstart", "-k", &launch_target(meta)])).map(|_| 0),
         #[cfg(target_os = "macos")] (Manager::Launchd, "restart") => launchd_start(meta, &path).map(|_| 0), #[cfg(target_os = "macos")]
         (Manager::Launchd, "status") => Command::new("launchctl").args(["print", &launch_target(meta)]).status().map(|s| s.code().unwrap_or(1))
-            .map_err(|e| format!("cannot run launchctl: {e}")), (Manager::Systemd, action) => systemctl(&[action, meta.unit], action != "status"),
+            .map_err(|e| format!("cannot run launchctl: {e}")),
+        (Manager::Systemd, "start" | "stop" | "restart" | "status") => systemctl(&[action, meta.unit], action != "status"),
         _ => Err(format!("unknown service command {action}\n{}", usage(meta)))
     }
 }
