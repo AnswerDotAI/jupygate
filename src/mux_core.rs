@@ -10,6 +10,7 @@ use std::fmt;
 use std::future::Future;
 use std::mem;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
@@ -621,6 +622,20 @@ impl MuxCore {
     pub async fn control(&self, msg_type: &str, content: Value) -> Result<(), String> {
         let ch = self.channels().ok_or("kernel has no live channels")?;
         ch.send(&Msg::new(&self.session, "control", msg_type, content)).await
+    }
+
+    pub async fn control_request(self: &Arc<Self>, msg_type: &str, content: Value, timeout: Duration) -> Result<Msg, String> {
+        let ch = self.channels().ok_or("kernel has no live channels")?;
+        let mut msg = Msg::new(&self.session, "control", msg_type, content);
+        let mut running = self.begin_collector(&mut msg);
+        ch.send(&msg).await?;
+        tokio::time::timeout(timeout, async {
+            while let Some(ev) = running.rx.recv().await {
+                let m = ev.map_err(|e| e.to_string())?;
+                if m.channel == "control" && m.parent_id() == Some(&running.msg_id) { return Ok(m); }
+            }
+            Err("kernel channels closed".into())
+        }).await.map_err(|_| format!("{msg_type} timed out"))?
     }
 
     pub async fn delete_subshell(&self, id: &str) -> Result<(), String> {

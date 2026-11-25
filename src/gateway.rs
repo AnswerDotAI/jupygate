@@ -86,8 +86,8 @@ impl Launch {
         appendenv.extend(self.appendenv.iter().map(|(k, v)| (k.clone(), v.clone())));
         let url = ctx.self_url.as_deref().or_else(|| crate::SELF_URL.get().map(String::as_str));
         let extra = [
-            ("JUPYGATE_URL", url), ("JUPYGATE_KERNEL_ID", Some(kid)), ("JUPYGATE_KERNEL_PATH", ctx.path.as_deref()),
-            ("JUPYGATE_LAUNCHER", self.launcher.as_deref()),
+            ("JUPYGATE_URL", url), ("JUPYGATE_ROOT", root.to_str()), ("JUPYGATE_KERNEL_ID", Some(kid)),
+            ("JUPYGATE_KERNEL_PATH", ctx.path.as_deref()), ("JUPYGATE_LAUNCHER", self.launcher.as_deref()),
         ];
         KernelProc::spawn(&SpawnOpts { argv: &self.argv, appendenv: Some(&appendenv), extra_env: &extra, cwd: cwd.as_deref().and_then(|p| p.to_str()),
             conn_prefix: ctx.conn_prefix })

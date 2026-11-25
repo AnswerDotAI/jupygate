@@ -27,9 +27,9 @@ def test_restart_story(gateway, files_root):
     ses = Session(key=b'x')
     try:
         with _connect(gateway, kid, ses) as ws:
-            ws.send(to_frame(_exec(ses, 'import os; (os.getcwd(), os.environ["JUPYGATE_KERNEL_ID"], os.environ["JUPYGATE_KERNEL_PATH"])')))
+            ws.send(to_frame(_exec(ses, 'import os; (os.getcwd(), os.environ["JUPYGATE_ROOT"], os.environ["JUPYGATE_KERNEL_ID"], os.environ["JUPYGATE_KERNEL_PATH"])')))
             m = _recv_until(ws, lambda m: m['header']['msg_type'] == 'execute_result')
-            assert literal_eval(m['content']['data']['text/plain']) == (str((files_root/'proj').resolve()), kid, 'proj/restart.ipynb')
+            assert literal_eval(m['content']['data']['text/plain']) == (str((files_root/'proj').resolve()), str(files_root), kid, 'proj/restart.ipynb')
             ws.send(to_frame(_exec(ses, 'import time\nwhile True: time.sleep(0.05)')))
             _recv_until(ws, lambda m: m['header']['msg_type'] == 'status' and m['content'].get('execution_state') == 'busy')
             t0 = time.monotonic()
@@ -48,9 +48,9 @@ def test_restart_story(gateway, files_root):
             ws.send(to_frame(_exec(ses, '6*7')))
             m = _recv_until(ws, lambda m: m['header']['msg_type'] == 'execute_result')
             assert m['content']['data']['text/plain'] == '42'
-            ws.send(to_frame(_exec(ses, 'import os; (os.getcwd(), os.environ["JUPYGATE_KERNEL_ID"], os.environ["JUPYGATE_KERNEL_PATH"])')))
+            ws.send(to_frame(_exec(ses, 'import os; (os.getcwd(), os.environ["JUPYGATE_ROOT"], os.environ["JUPYGATE_KERNEL_ID"], os.environ["JUPYGATE_KERNEL_PATH"])')))
             m = _recv_until(ws, lambda m: m['header']['msg_type'] == 'execute_result')
-            assert literal_eval(m['content']['data']['text/plain']) == (str((files_root/'proj').resolve()), kid, 'proj/restart.ipynb')
+            assert literal_eval(m['content']['data']['text/plain']) == (str((files_root/'proj').resolve()), str(files_root), kid, 'proj/restart.ipynb')
             ws.send(to_frame(_exec(ses, 'import subprocess, sys; subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]).pid')))
             child_pid = int(_recv_until(ws, lambda m: m['header']['msg_type'] == 'execute_result')['content']['data']['text/plain'])
             assert httpx.post(f'{gateway}/api/kernels/{kid}/restart', timeout=30).status_code == 200
