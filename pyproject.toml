@@ -7,7 +7,7 @@ name = "jupygate"
 dynamic = ["version"]
 description = "Jupyter kernel and terminal gateway with an MCP server, as a single binary"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 readme = "README.md"
 authors = [{name = "Jeremy Howard"}]
 maintainers = [{name = "fast.ai", email = "infos@fast.ai"}]
@@ -37,6 +37,7 @@ Homepage = "https://github.com/AnswerDotAI/jupygate"
 Repository = "https://github.com/AnswerDotAI/jupygate"
 Issues = "https://github.com/AnswerDotAI/jupygate/issues"
 
+Documentation = "https://AnswerDotAI.github.io/jupygate/"
 [tool.maturin]
 bindings = "bin"
 
